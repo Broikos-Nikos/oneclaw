@@ -3,7 +3,7 @@
 // The main agent uses its LLM intelligence to decide routing.
 // Sub-agents are discovered from config/soul folders — any name the user creates.
 
-use crate::agent::Agent;
+use crate::agent::{Agent, TurnResult};
 use crate::config::Config;
 use anyhow::Result;
 use std::collections::HashMap;
@@ -40,12 +40,23 @@ impl Orchestrator {
             .get_mut("main")
             .ok_or_else(|| anyhow::anyhow!("Main agent not found"))?;
 
-        let response = main_agent.turn(message).await?;
+        let result = main_agent.turn(message).await?;
 
-        // Check if the main agent called transfer_to_agent tool
-        // If so, the tool itself handles the delegation and returns results
-        // The main agent then synthesizes the response
-        Ok(("main".to_string(), response))
+        match result {
+            TurnResult::Response(response) => Ok(("main".to_string(), response)),
+            TurnResult::Transfer { target_agent, task } => {
+                // If the main agent wants to delegate, run the sub-agent
+                if let Some(sub) = agents.get_mut(&target_agent) {
+                    let sub_result = sub.turn(&task).await?;
+                    match sub_result {
+                        TurnResult::Response(resp) => Ok((target_agent, resp)),
+                        _ => Ok((target_agent, "[Sub-agent delegation not supported]".into())),
+                    }
+                } else {
+                    anyhow::bail!("Agent '{}' not found", target_agent)
+                }
+            }
+        }
     }
 
     /// Execute a task directly on a named agent.
@@ -59,7 +70,11 @@ impl Orchestrator {
             .get_mut(agent_name)
             .ok_or_else(|| anyhow::anyhow!("Agent '{}' not found", agent_name))?;
 
-        agent.turn(message).await
+        let result = agent.turn(message).await?;
+        match result {
+            TurnResult::Response(resp) => Ok(resp),
+            TurnResult::Transfer { .. } => Ok("[Agent attempted delegation]".into()),
+        }
     }
 
     /// Execute a planned sequence of steps across different agents.
@@ -94,7 +109,11 @@ impl Orchestrator {
                 .get_mut(agent_name.as_str())
                 .ok_or_else(|| anyhow::anyhow!("Agent '{}' not found", agent_name))?;
 
-            let output = agent.turn(&message).await?;
+            let result = agent.turn(&message).await?;
+            let output = match result {
+                TurnResult::Response(resp) => resp,
+                TurnResult::Transfer { .. } => "[Agent attempted delegation]".into(),
+            };
 
             // Accumulate context
             context.push_str(&format!(

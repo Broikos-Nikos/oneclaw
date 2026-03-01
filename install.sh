@@ -2,13 +2,13 @@
 set -euo pipefail
 
 # OneClaw Installer
-# Usage: curl -sSL https://raw.githubusercontent.com/YOUR_USERNAME/oneclaw/main/install.sh | bash
+# Usage: curl -sSL https://raw.githubusercontent.com/Broikos-Nikos/oneclaw/main/install.sh | bash
 
 REPO="Broikos-Nikos/oneclaw"
 BRANCH="main"
 
 echo ""
-echo "  🦀 OneClaw Installer"
+echo "OneClaw Installer"
 echo "  Multi-agent AI assistant with router architecture"
 echo ""
 

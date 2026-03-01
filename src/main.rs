@@ -1,37 +1,47 @@
 #![warn(clippy::all)]
 #![forbid(unsafe_code)]
+#![allow(dead_code)]
 
 //! OneClaw — Multi-agent AI assistant with router architecture.
-//! Fork of ZeroClaw, streamlined for multi-agent orchestration.
-//!
-//! Only the "main" agent is created by default. Users create sub-agents
-//! by adding soul folders and provider configs. All agents share the same
-//! workspace and have the same structure — the main agent just has
-//! routing/transfer capabilities.
+//! Fork of ZeroClaw. Local-first, multi-provider, fully autonomous.
 
 mod agent;
 mod channels;
 mod config;
+mod coordination;
+mod cron;
+mod daemon;
+mod doctor;
+mod goals;
+mod health;
+mod heartbeat;
+mod hooks;
 mod identity;
 mod memory;
 mod providers;
 mod router;
+mod service;
 mod tools;
+mod update;
 
-use crate::agent::Agent;
-use crate::channels::SendMessage;
+use crate::agent::{Agent, TurnResult};
 use crate::config::Config;
-use crate::router::Orchestrator;
-use anyhow::Result;
+use crate::cron::{CronStore, TaskKind};
+use crate::goals::{GoalStatus, GoalStore};
+use crate::memory::MemoryBackend;
+use crate::service::ServiceAction;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::Arc;
 
-/// OneClaw — Multi-agent AI assistant with router architecture.
+// ─── CLI ─────────────────────────────────────────────────────────────────────
+
+/// OneClaw — Multi-agent AI assistant. Local-first, multi-provider.
 #[derive(Parser, Debug)]
 #[command(name = "oneclaw")]
 #[command(version)]
-#[command(about = "Multi-agent AI assistant. One main agent routes tasks to user-created sub-agents.", long_about = None)]
+#[command(about = "Multi-agent AI assistant with local Ollama, Anthropic, and OpenAI support.")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -44,55 +54,75 @@ enum Commands {
 Start the AI agent loop.
 
 The main agent receives your message and decides whether to handle it
-or delegate to a sub-agent. Use --agent to force a specific agent.
+or delegate to a sub-agent.
 
 Examples:
   oneclaw agent                           # interactive session
   oneclaw agent -m \"Build a REST API\"     # single-shot
-  oneclaw agent --agent developer -m \"Fix the bug\"")]
+  oneclaw agent --agent developer -m \"Fix the bug\"
+  oneclaw agent --memory sqlite           # explicit memory backend
+  oneclaw agent --memory none             # disable memory injection")]
     Agent {
-        /// Single message mode
         #[arg(short, long)]
         message: Option<String>,
-
-        /// Force a specific agent by name (bypasses router)
         #[arg(short = 'a', long)]
         agent: Option<String>,
+        /// Memory backend override (sqlite, markdown, vector, none)
+        #[arg(long)]
+        memory: Option<String>,
     },
 
     /// Initialize workspace, config, and main agent
-    #[command(long_about = "\
-Set up OneClaw for first use.
-
-Creates the config file, workspace directory, and the main agent's
-soul folder. Sub-agents can be created later with 'oneclaw create-agent'.
-
-Examples:
-  oneclaw onboard              # guided setup
-  oneclaw onboard --defaults   # use all defaults")]
     Onboard {
-        /// Skip prompts and use all defaults
         #[arg(long)]
         defaults: bool,
     },
 
-    /// Create a new sub-agent
+    /// Start the long-running autonomous daemon (channels + heartbeat + cron)
     #[command(long_about = "\
-Create a new sub-agent with its own soul folder and optional provider config.
+Start the long-running autonomous daemon.
 
-The agent gets a folder in ~/.oneclaw/agents/<name>/ with identity.json
-and SOUL.md that you can customize. If no provider is configured for it,
-it falls back to the main agent's provider.
+Launches all configured channels (Telegram/WhatsApp), the heartbeat
+monitor, and the cron scheduler. Use 'oneclaw service install' to
+register it as an OS service.
 
 Examples:
-  oneclaw create-agent developer
-  oneclaw create-agent creative --role \"Writer and content creator\"
-  oneclaw create-agent researcher")]
-    CreateAgent {
-        /// Agent name (lowercase, no spaces)
-        name: String,
+  oneclaw daemon")]
+    Daemon,
 
-        /// Role description
+    /// Run diagnostics (config, providers, channels, connectivity)
+    #[command(name = "doctor")]
+    Doctor,
+
+    /// Check for updates / self-update
+    Update {
+        /// Check for updates without installing
+        #[arg(long, conflicts_with = "force")]
+        check: bool,
+        /// Force reinstall even if already at latest
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Manage cron-scheduled tasks
+    #[command(subcommand)]
+    Cron(CronCommands),
+
+    /// Manage long-term goals
+    #[command(subcommand)]
+    Goal(GoalCommands),
+
+    /// Manage memory entries
+    #[command(subcommand)]
+    Memory(MemoryCommands),
+
+    /// Manage OS service (install/uninstall/status)
+    #[command(subcommand)]
+    Service(ServiceCommands),
+
+    /// Create a new sub-agent
+    CreateAgent {
+        name: String,
         #[arg(long)]
         role: Option<String>,
     },
@@ -103,9 +133,103 @@ Examples:
     /// Show current configuration and status
     Status,
 
+    /// Show health check results
+    Health,
+
     /// Print sample configuration
     SampleConfig,
 }
+
+#[derive(Subcommand, Debug)]
+enum CronCommands {
+    /// List all scheduled tasks
+    List,
+    /// Add a cron task (cron expression)
+    Add {
+        /// Task name
+        name: String,
+        /// Message to send to the agent
+        message: String,
+        /// Cron expression (5-field, e.g. "0 9 * * 1-5")
+        #[arg(long)]
+        cron: Option<String>,
+        /// Interval in seconds
+        #[arg(long)]
+        every: Option<u64>,
+        /// Fire once at RFC3339 timestamp
+        #[arg(long)]
+        at: Option<String>,
+    },
+    /// Enable a cron task by ID
+    Enable { id: String },
+    /// Disable a cron task by ID
+    Disable { id: String },
+    /// Remove a cron task
+    Remove { id: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum GoalCommands {
+    /// List goals
+    List {
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Add a goal
+    Add {
+        title: String,
+        #[arg(long, default_value = "")]
+        description: String,
+        #[arg(long, default_value = "3")]
+        priority: u8,
+    },
+    /// Complete a goal
+    Complete { id: String },
+    /// Cancel a goal
+    Cancel { id: String },
+    /// Delete a goal
+    Delete { id: String },
+}
+
+#[derive(Subcommand, Debug)]
+enum MemoryCommands {
+    /// List memory entries
+    List {
+        #[arg(long)]
+        category: Option<String>,
+        #[arg(long, default_value = "50")]
+        limit: usize,
+    },
+    /// Search memory
+    Search {
+        query: String,
+        #[arg(long, default_value = "10")]
+        limit: usize,
+    },
+    /// Delete a memory entry by ID
+    Forget { id: String },
+    /// Clear all memories (or by category)
+    Clear {
+        #[arg(long)]
+        category: Option<String>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Show memory statistics
+    Stats,
+}
+
+#[derive(Subcommand, Debug)]
+enum ServiceCommands {
+    /// Install as OS service (systemd/launchd/task scheduler)
+    Install,
+    /// Uninstall OS service
+    Uninstall,
+    /// Show service status
+    Status,
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -120,351 +244,647 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Agent { message, agent } => cmd_agent(message, agent).await,
+        Commands::Agent { message, agent, memory } => cmd_agent(message, agent, memory).await,
         Commands::Onboard { defaults } => cmd_onboard(defaults),
+        Commands::Daemon => cmd_daemon().await,
+        Commands::Doctor => cmd_doctor().await,
+        Commands::Update { check, force } => cmd_update(check, force).await,
+        Commands::Cron(sc) => cmd_cron(sc),
+        Commands::Goal(sc) => cmd_goal(sc),
+        Commands::Memory(sc) => cmd_memory(sc).await,
+        Commands::Service(sc) => cmd_service(sc),
         Commands::CreateAgent { name, role } => cmd_create_agent(&name, role.as_deref()),
         Commands::ListAgents => cmd_list_agents(),
         Commands::Status => cmd_status(),
-        Commands::SampleConfig => {
-            println!("{}", Config::sample_toml());
-            Ok(())
-        }
+        Commands::Health => cmd_health(),
+        Commands::SampleConfig => { println!("{}", Config::sample_toml()); Ok(()) }
     }
 }
 
-/// Run the agent — either single-shot or interactive.
-async fn cmd_agent(message: Option<String>, force_agent: Option<String>) -> Result<()> {
-    let config = Config::load()?;
+// ─── Agent ────────────────────────────────────────────────────────────────────
 
-    if config.providers.is_empty() {
-        eprintln!("❌ No providers configured. Run 'oneclaw onboard' or add providers to your config.");
-        eprintln!("   Config location: {}", Config::default_path().display());
-        std::process::exit(1);
-    }
-
+/// Run a message through the main agent with full delegation.
+///
+/// When the main agent issues `transfer_to_agent`, this function:
+/// 1. Builds the requested sub-agent and runs it on the task.
+/// 2. Feeds the sub-agent's result back to the main agent via `continue_with_result`.
+/// 3. Loops until the main agent produces a final text response.
+///
+/// The main agent preserves conversation history across calls so the user
+/// gets a continuous interactive session.
+async fn run_with_delegation(main_agent: &mut Agent, input: &str, config: &Config) -> Result<String> {
     let workspace_dir = config.workspace_dir();
-    std::fs::create_dir_all(&workspace_dir)?;
-
     let souls_dir = config.souls_dir();
     let available_agents = identity::discover_agents(&souls_dir);
 
-    let config = Arc::new(config);
+    let mut current_result = main_agent.turn(input).await?;
 
-    // Build agents
-    let mut agents: HashMap<String, Agent> = HashMap::new();
+    loop {
+        match current_result {
+            TurnResult::Response(text) => return Ok(text),
+            TurnResult::Transfer { target_agent, task } => {
+                println!(
+                    "{}",
+                    console::style(format!("  → [{target_agent}] working on task...")).dim()
+                );
 
-    for agent_name in &available_agents {
-        let is_main = agent_name == "main";
-        let tools = tools::core_tools(&workspace_dir);
-        match Agent::from_config(&config, agent_name, is_main, tools, &available_agents) {
-            Ok(agent) => {
-                agents.insert(agent_name.clone(), agent);
-            }
-            Err(e) => {
-                if is_main {
-                    eprintln!("❌ Failed to initialize main agent: {e}");
-                    std::process::exit(1);
-                }
-                tracing::warn!("Failed to initialize agent '{}': {e}", agent_name);
-            }
-        }
-    }
-
-    let _orchestrator = Orchestrator::new(config.clone());
-
-    // Start communication channels (if configured)
-    let (mut channel_rx, active_channels) = channels::start_channels(&config).await?;
-    let has_channels = !active_channels.is_empty();
-    if has_channels {
-        let names: Vec<&str> = active_channels.iter().map(|c| c.name()).collect();
-        println!(
-            "{}",
-            console::style(format!("📡 Active channels: {}", names.join(", ")))
-                .green()
-                .bold()
-        );
-    }
-
-    if let Some(msg) = message {
-        // Single-shot mode
-        let (agent_name, response) = if let Some(ref forced) = force_agent {
-            if !agents.contains_key(forced.as_str()) {
-                eprintln!("❌ Agent '{}' not found. Available: {}", forced, available_agents.join(", "));
-                std::process::exit(1);
-            }
-            let agent = agents.get_mut(forced.as_str()).unwrap();
-            let resp = agent.turn(&msg).await?;
-            (forced.clone(), resp)
-        } else {
-            // Route through main agent
-            let main = agents.get_mut("main")
-                .ok_or_else(|| anyhow::anyhow!("Main agent not found"))?;
-            let resp = main.turn(&msg).await?;
-            ("main".to_string(), resp)
-        };
-
-        let label = console::style(format!("[{}]", agent_name)).cyan().bold();
-        println!("{label} {response}");
-    } else {
-        // Interactive mode
-        println!("{}", console::style("🦀 OneClaw — Multi-Agent AI Assistant").bold().cyan());
-        println!("Messages go through the main agent, which routes to sub-agents as needed.");
-        if available_agents.len() > 1 {
-            let subs: Vec<_> = available_agents.iter().filter(|a| a.as_str() != "main").collect();
-            println!("Sub-agents: {}", subs.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "));
-        } else {
-            println!("No sub-agents configured. Use 'oneclaw create-agent <name>' to add one.");
-        }
-        println!("Commands: /clear, /status, /agent <name>, /agents, /quit\n");
-
-        // Spawn a task for CLI input so we can select! between CLI and channels
-        let (cli_tx, mut cli_rx) = tokio::sync::mpsc::channel::<String>(16);
-        let cli_handle = tokio::task::spawn_blocking(move || {
-            let mut rl = rustyline::DefaultEditor::new().expect("Failed to create readline");
-            loop {
-                let line = match rl.readline("oneclaw> ") {
-                    Ok(line) => line,
-                    Err(rustyline::error::ReadlineError::Interrupted
-                        | rustyline::error::ReadlineError::Eof) => break,
+                // Build and run the sub-agent on the delegated task.
+                let sub_tools = tools::core_tools(&workspace_dir);
+                let sub_result = match Agent::from_config(
+                    config,
+                    &target_agent,
+                    false,
+                    sub_tools,
+                    &available_agents,
+                ) {
+                    Ok(mut sub_agent) => {
+                        match sub_agent.turn(&task).await {
+                            Ok(TurnResult::Response(r)) => {
+                                println!(
+                                    "{}",
+                                    console::style(format!("  ✓ [{target_agent}] completed")).dim()
+                                );
+                                r
+                            }
+                            Ok(TurnResult::Transfer { target_agent: t2, task: t2_task }) => {
+                                // Sub-agents should not re-delegate; handle gracefully.
+                                format!(
+                                    "[{target_agent} tried to re-delegate to {t2}: {t2_task}]"
+                                )
+                            }
+                            Err(e) => format!("[{target_agent} error: {e}]"),
+                        }
+                    }
                     Err(e) => {
-                        eprintln!("Error: {e}");
-                        break;
+                        eprintln!(
+                            "  ✗ Cannot build agent '{}': {}",
+                            target_agent, e
+                        );
+                        format!("[Failed to create agent '{target_agent}': {e}]")
                     }
                 };
-                let trimmed = line.trim().to_string();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let _ = rl.add_history_entry(&trimmed);
-                if cli_tx.blocking_send(trimmed).is_err() {
-                    break;
-                }
+
+                // Feed result back to the main agent and continue the loop.
+                current_result = main_agent
+                    .continue_with_result(&target_agent, &sub_result)
+                    .await?;
             }
+        }
+    }
+}
+
+async fn cmd_agent(
+    message: Option<String>,
+    agent_name: Option<String>,
+    memory_override: Option<String>,
+) -> Result<()> {
+    let config = Config::load()?;
+    let souls_dir = config.souls_dir();
+    let workspace_dir = config.workspace_dir();
+    std::fs::create_dir_all(&workspace_dir)?;
+
+    let available_agents = identity::discover_agents(&souls_dir);
+    if available_agents.is_empty() {
+        eprintln!("❌ No agents found. Run 'oneclaw onboard' first.");
+        return Ok(());
+    }
+    let main_name = agent_name.as_deref().unwrap_or("main");
+    let is_main = main_name == "main";
+
+    let mut agent = Agent::from_config(&config, main_name, is_main, tools::core_tools(&workspace_dir), &available_agents)?;
+
+    // Build memory if configured
+    let memory_backend_str = memory_override
+        .as_deref()
+        .unwrap_or(&config.memory.backend);
+    let memory_backend = MemoryBackend::from_str(memory_backend_str).unwrap_or_default();
+    let data_dir = Config::data_dir();
+    let memory = memory::build_memory(
+        &memory_backend,
+        &data_dir,
+        &config.memory.embed_url,
+        &config.memory.embed_model,
+    ).await.unwrap_or(None);
+
+    // Inject recent memories into first turn if any
+    let memory_context = if let Some(ref mem) = memory {
+        let entries = mem.recall(None, config.memory.recall_limit).await.unwrap_or_default();
+        memory::entries_to_prompt(&entries)
+    } else {
+        String::new()
+    };
+
+    // Start communication channels if configured (background)
+    let (mut chan_rx, _) = channels::start_channels(&config).await
+        .unwrap_or_else(|_| {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            (rx, vec![])
         });
 
-        let mut force_name: Option<String> = force_agent;
+    match message {
+        Some(msg) => {
+            // Single-shot mode
+            let input = if memory_context.is_empty() {
+                msg.clone()
+            } else {
+                format!("{memory_context}\n{msg}")
+            };
+            let response = run_with_delegation(&mut agent, &input, &config).await?;
+            println!("{response}");
 
-        loop {
-            tokio::select! {
-                // CLI input
-                cli_msg = cli_rx.recv() => {
-                    let Some(trimmed) = cli_msg else { break };
+            // Store conversation in memory
+            if let Some(ref mem) = memory {
+                let _ = mem.store("conversation", &format!("User: {msg}\nAgent: {response}"), None, Some(main_name)).await;
+            }
+        }
+        None => {
+            // Interactive mode
+            println!(
+                "{}",
+                console::style(format!("OneClaw [{main_name}] — type 'exit' or press Ctrl+C to quit"))
+                    .dim()
+            );
 
-                    // Handle commands
-                    if trimmed.starts_with('/') {
-                        match trimmed.as_str() {
-                            "/quit" | "/exit" | "/q" => break,
-                            "/clear" => {
-                                for agent in agents.values_mut() {
-                                    agent.clear_history();
-                                }
-                                println!("{}", console::style("History cleared.").dim());
-                                continue;
-                            }
-                            "/agents" | "/status" => {
-                                println!("\n{}", console::style("Agents:").bold());
-                                for name in &available_agents {
-                                    let marker = if force_name.as_ref() == Some(name) { " ← forced" } else { "" };
-                                    let main_tag = if name == "main" { " (router)" } else { "" };
-                                    println!("  • {name}{main_tag}{marker}");
-                                }
-                                println!("  Routing: {}", if force_name.is_some() { "bypassed" } else { "main agent decides" });
-                                if has_channels {
-                                    let names: Vec<&str> = active_channels.iter().map(|c| c.name()).collect();
-                                    println!("  Channels: {}", names.join(", "));
-                                }
-                                println!();
-                                continue;
-                            }
-                            _ if trimmed.starts_with("/agent ") => {
-                                let name = trimmed.strip_prefix("/agent ").unwrap().trim();
-                                if name == "auto" || name == "main" {
-                                    force_name = None;
-                                    println!("{}", console::style("Routing: main agent decides").dim());
-                                } else if agents.contains_key(name) {
-                                    force_name = Some(name.to_string());
-                                    println!("{}", console::style(format!("Forced agent: {name}")).dim());
-                                } else {
-                                    eprintln!("Unknown agent: {name}. Available: {}", available_agents.join(", "));
-                                }
-                                continue;
-                            }
-                            _ => {
-                                eprintln!("Unknown command: {trimmed}");
-                                continue;
-                            }
-                        }
-                    }
+            let mut rl = rustyline::DefaultEditor::new()?;
+            let mut first_turn = true;
 
-                    // Route the message
-                    let target = force_name.as_deref().unwrap_or("main");
-                    let agent = agents.get_mut(target)
-                        .ok_or_else(|| anyhow::anyhow!("Agent '{}' not found", target))?;
-
-                    match agent.turn(&trimmed).await {
-                        Ok(response) => {
-                            let label = console::style(format!("[{}]", target)).cyan().bold();
-                            println!("\n{label}\n{response}\n");
-                        }
-                        Err(e) => {
-                            eprintln!("{} {e}", console::style("Error:").red().bold());
-                        }
-                    }
+            loop {
+                // Handle incoming channel messages
+                while let Ok(chan_msg) = chan_rx.try_recv() {
+                    let prefix = format!("[{}] {}: ", chan_msg.channel, chan_msg.sender);
+                    let response = run_with_delegation(&mut agent, &format!("{prefix}{}", chan_msg.content), &config).await?;
+                    println!("{}", console::style(&prefix).dim());
+                    println!("{response}");
                 }
 
-                // Channel messages (Telegram, etc.)
-                channel_msg = channel_rx.recv() => {
-                    let Some(msg) = channel_msg else { continue };
+                let prompt = format!(
+                    "{} ",
+                    console::style("▶").cyan().bold()
+                );
+                let readline = rl.readline(&prompt);
+                match readline {
+                    Ok(line) => {
+                        let line = line.trim().to_string();
+                        if line.is_empty() { continue; }
+                        if line == "exit" || line == "quit" { break; }
+                        let _ = rl.add_history_entry(&line);
 
-                    tracing::info!(
-                        "[{}] message from {}: {}",
-                        msg.channel,
-                        msg.sender,
-                        if msg.content.len() > 80 { format!("{}...", &msg.content[..80]) } else { msg.content.clone() }
-                    );
+                        let input = if first_turn && !memory_context.is_empty() {
+                            first_turn = false;
+                            format!("{memory_context}\n{line}")
+                        } else {
+                            first_turn = false;
+                            line.clone()
+                        };
 
-                    // Find the channel to reply through
-                    let reply_channel = active_channels
-                        .iter()
-                        .find(|c| c.name() == msg.channel);
+                        let response = run_with_delegation(&mut agent, &input, &config).await?;
+                        println!("\n{response}\n");
 
-                    let Some(reply_channel) = reply_channel else {
-                        tracing::warn!("No channel found for '{}' to reply", msg.channel);
-                        continue;
-                    };
-
-                    // Start typing indicator
-                    let _ = reply_channel.start_typing(&msg.reply_target).await;
-
-                    // Route through main agent
-                    let target = force_name.as_deref().unwrap_or("main");
-                    let agent = match agents.get_mut(target) {
-                        Some(a) => a,
-                        None => {
-                            tracing::error!("Agent '{}' not found for channel message", target);
-                            let _ = reply_channel.stop_typing(&msg.reply_target).await;
-                            continue;
+                        if let Some(ref mem) = memory {
+                            let _ = mem.store("conversation", &format!("User: {line}\nAgent: {response}"), None, Some(main_name)).await;
                         }
-                    };
-
-                    let response = match agent.turn(&msg.content).await {
-                        Ok(resp) => resp,
-                        Err(e) => {
-                            tracing::error!("Agent error processing channel message: {e}");
-                            format!("❌ Error: {e}")
-                        }
-                    };
-
-                    // Stop typing and send reply
-                    let _ = reply_channel.stop_typing(&msg.reply_target).await;
-                    if let Err(e) = reply_channel.send(&SendMessage::new(&response, &msg.reply_target)).await {
-                        tracing::error!("Failed to send reply via {}: {e}", msg.channel);
                     }
+                    Err(rustyline::error::ReadlineError::Interrupted) => break,
+                    Err(rustyline::error::ReadlineError::Eof) => break,
+                    Err(e) => { eprintln!("Error: {e}"); break; }
                 }
             }
         }
-
-        cli_handle.abort();
-        println!("\n{}", console::style("Goodbye! 🦀").dim());
     }
-
     Ok(())
 }
 
-/// Onboard — set up config, workspace, and main agent soul.
-fn cmd_onboard(defaults: bool) -> Result<()> {
-    println!("{}", console::style("🦀 OneClaw Setup").bold().cyan());
+// ─── Onboard ──────────────────────────────────────────────────────────────────
+
+fn cmd_onboard(use_defaults: bool) -> Result<()> {
+    println!("{}", console::style("OneClaw Setup").bold().cyan());
     println!();
 
-    let config = if defaults {
-        Config::default_config()
+    let config_path = Config::default_path();
+    if config_path.exists() && !use_defaults {
+        let ok = dialoguer::Confirm::new()
+            .with_prompt("Config already exists. Reconfigure?")
+            .default(false)
+            .interact()?;
+        if !ok { return Ok(()); }
+    }
+
+    let config = if use_defaults {
+        let mut c = Config::default();
+        c.providers.insert("main".to_string(), config::ProviderConfig {
+            kind: "ollama".to_string(),
+            api_key: String::new(),
+            model: "llama3.2".to_string(),
+            base_url: None,
+            temperature: 0.7,
+        });
+        c
     } else {
-        println!("This will set up the main agent. You can add sub-agents later.\n");
+        println!("This will set up the main agent.\n");
 
-        let api_key: String = dialoguer::Input::new()
-            .with_prompt("OpenRouter API key")
-            .interact_text()?;
+        // Provider selection
+        let provider_options = &[
+            "anthropic         — Claude (cloud, API key required)",
+            "openai            — GPT-4o / o3-mini (cloud, API key required)",
+            "ollama            — local Ollama server (no API key needed)",
+            "compatible        — any OpenAI-compatible endpoint (custom base_url)",
+        ];
+        let provider_idx = dialoguer::Select::new()
+            .with_prompt("LLM provider")
+            .items(provider_options)
+            .default(0)
+            .interact()?;
+        let kind = match provider_idx {
+            0 => "anthropic",
+            1 => "openai",
+            2 => "ollama",
+            _ => "compatible",
+        }.to_string();
 
-        let model: String = dialoguer::Input::new()
-            .with_prompt("Model for main agent")
-            .default("anthropic/claude-sonnet-4-20250514".into())
-            .interact_text()?;
+        let (api_key, models, base_url_override): (String, Vec<&str>, Option<String>) =
+            match kind.as_str() {
+                "anthropic" => {
+                    let key: String = dialoguer::Password::new()
+                        .with_prompt("Anthropic API key")
+                        .interact()?;
+                    (key, vec!["claude-sonnet-4-20250514", "claude-opus-4-20250514", "(custom)"], None)
+                }
+                "openai" => {
+                    let key: String = dialoguer::Password::new()
+                        .with_prompt("OpenAI API key")
+                        .interact()?;
+                    (key, vec!["gpt-4o", "gpt-4.1", "gpt-4.1-mini", "gpt-4.1-nano", "o4-mini", "o3-mini", "(custom)"], None)
+                }
+                "ollama" => {
+                    let url: String = dialoguer::Input::new()
+                        .with_prompt("Ollama base URL")
+                        .default("http://localhost:11434".into())
+                        .interact_text()?;
+                    let models_list: Vec<&str> = vec![
+                        "llama3.2", "llama3.1:8b", "mistral", "deepseek-r1:8b",
+                        "qwen2.5:7b", "phi4", "gemma3:9b", "(custom)",
+                    ];
+                    (String::new(), models_list, Some(url))
+                }
+                _ => {
+                    // compatible — custom OpenAI-compatible endpoint
+                    let url: String = dialoguer::Input::new()
+                        .with_prompt("Endpoint base URL (e.g. http://localhost:8080/v1)")
+                        .interact_text()?;
+                    let key: String = dialoguer::Input::new()
+                        .with_prompt("API key (leave empty if none required)")
+                        .allow_empty(true)
+                        .interact_text()?;
+                    let model_name: String = dialoguer::Input::new()
+                        .with_prompt("Model name")
+                        .interact_text()?;
+                    // Already have model — skip model selection by using a sentinel
+                    (key, vec![], Some(format!("_custom_model_{model_name}_{url}")))
+                }
+            };
 
-        let mut providers = HashMap::new();
-        providers.insert(
-            "main".to_string(),
-            config::ProviderConfig {
-                kind: "openrouter".into(),
-                api_key,
-                model,
-                base_url: None,
-                temperature: 0.7,
-            },
-        );
+        // For compatible with pre-filled model, skip the selector
+        let (model, base_url) = if kind == "compatible" {
+            if let Some(ref enc) = base_url_override {
+                // Decode _custom_model_<model>_<url> sentinel
+                let stripped = enc.strip_prefix("_custom_model_").unwrap_or("");
+                let (model_part, url_part) = stripped
+                    .split_once('_')
+                    .unwrap_or((stripped, "http://localhost:8080/v1"));
+                (model_part.to_string(), Some(url_part.to_string()))
+            } else {
+                let m: String = dialoguer::Input::new()
+                    .with_prompt("Model name")
+                    .interact_text()?;
+                let u: String = dialoguer::Input::new()
+                    .with_prompt("Endpoint base URL")
+                    .interact_text()?;
+                (m, Some(u))
+            }
+        } else {
+            let model_idx = dialoguer::Select::new()
+                .with_prompt("Model")
+                .items(&models)
+                .default(0)
+                .interact()?;
+            let m: String = if models[model_idx] == "(custom)" {
+                dialoguer::Input::new().with_prompt("Model name").interact_text()?
+            } else {
+                models[model_idx].to_string()
+            };
+            (m, base_url_override)
+        };
 
-        Config {
-            providers,
-            workspace: config::WorkspaceConfig::default(),
-            agents: config::AgentsConfig::default(),
-            channels: config::ChannelsConfig::default(),
-        }
+        // Memory backend
+        let mem_backends = &["sqlite (default)", "markdown (file-per-entry)", "vector (semantic search)", "none (disabled)"];
+        let mem_idx = dialoguer::Select::new()
+            .with_prompt("Memory backend")
+            .items(mem_backends)
+            .default(0)
+            .interact()?;
+        let mem_backend = match mem_idx {
+            1 => "markdown",
+            2 => "vector",
+            3 => "none",
+            _ => "sqlite",
+        }.to_string();
+
+        // Telegram
+        let use_telegram = dialoguer::Confirm::new()
+            .with_prompt("Configure Telegram channel? (requires a Telegram bot token)")
+            .default(false)
+            .interact()?;
+        let telegram = if use_telegram {
+            println!("  → Create a bot: open Telegram, message @BotFather, run /newbot");
+            let token: String = dialoguer::Password::new().with_prompt("Bot token (from @BotFather)").interact()?;
+            Some(config::TelegramConfig {
+                bot_token: token,
+                allowed_users: vec!["*".to_string()],
+            })
+        } else { None };
+
+        // WhatsApp
+        let use_wa = dialoguer::Confirm::new()
+            .with_prompt("Configure WhatsApp channel? (requires Meta app + public webhook URL)")
+            .default(false)
+            .interact()?;
+        let whatsapp = if use_wa {
+            println!("  → Get your credentials at: https://developers.facebook.com/apps/");
+            let token: String = dialoguer::Password::new().with_prompt("Meta access token").interact()?;
+            let phone_id: String = dialoguer::Input::new().with_prompt("Phone number ID").interact_text()?;
+            let verify: String = dialoguer::Input::new()
+                .with_prompt("Webhook verify token (you choose a secret string)")
+                .default("oneclaw-verify".into())
+                .interact_text()?;
+            let port_str: String = dialoguer::Input::new()
+                .with_prompt("Webhook listener port")
+                .default("8443".into())
+                .interact_text()?;
+            let webhook_port: u16 = port_str.parse().unwrap_or(8443);
+            Some(config::WhatsAppConfig {
+                access_token: token,
+                phone_number_id: phone_id,
+                verify_token: verify,
+                allowed_numbers: vec!["*".to_string()],
+                webhook_port,
+            })
+        } else { None };
+
+        let mut c = Config::default();
+        c.providers.insert("main".to_string(), config::ProviderConfig {
+            kind,
+            api_key,
+            model,
+            base_url,
+            temperature: 0.7,
+        });
+        c.memory.backend = mem_backend;
+        c.channels.telegram = telegram;
+        c.channels.whatsapp = whatsapp;
+        c
     };
 
+    // Save config
     config.save()?;
-    println!("✅ Config saved to: {}", Config::default_path().display());
+    println!("✅ Config saved: {}", Config::default_path().display());
 
-    let workspace_dir = config.workspace_dir();
-    std::fs::create_dir_all(&workspace_dir)?;
-    println!("✅ Workspace created: {}", workspace_dir.display());
+    // Scaffold workspace and main agent
+    let workspace = config.workspace_dir();
+    std::fs::create_dir_all(&workspace)?;
+    println!("✅ Workspace: {}", workspace.display());
 
     let souls_dir = config.souls_dir();
     identity::scaffold_main(&souls_dir)?;
-    println!("✅ Main agent created: {}/main/", souls_dir.display());
+    println!("✅ Main agent (router) created: {}", souls_dir.join("main").display());
 
-    println!("\n{}", console::style("Setup complete! 🎉").green().bold());
-    println!("\nNext steps:");
-    println!("  oneclaw create-agent developer    # create a developer sub-agent");
-    println!("  oneclaw create-agent creative     # create a creative sub-agent");
-    println!("  oneclaw agent                     # start chatting\n");
+    // Init data dir
+    std::fs::create_dir_all(&Config::data_dir())?;
 
+    println!();
+    println!("{}", console::style("Setup complete!").bold().green());
+    println!();
+    println!("Next steps:");
+    println!("  oneclaw agent                          # start interactive chat");
+    println!("  oneclaw create-agent developer \\");
+    println!("    --role \"Software engineer\"           # add a specialist sub-agent");
+    println!("  oneclaw list-agents                    # see all agents");
+    println!("  oneclaw daemon                         # start background daemon (Telegram/WhatsApp)");
+    println!();
+    if config.channels.telegram.is_some() {
+        println!("  → Telegram: start a chat with your bot and message it.");
+        println!("    Run 'oneclaw daemon' to receive messages.");
+    }
+    if config.channels.whatsapp.is_some() {
+        println!("  → WhatsApp: point your Meta webhook to http://<your-ip>:<port>/webhook");
+        println!("    Use ngrok or Cloudflare Tunnel to expose the port publicly.");
+        println!("    Run 'oneclaw daemon' to start the webhook listener.");
+    }
+    println!();
+    println!("Tip: edit {}  to customize the main agent's personality.", souls_dir.join("main").join("SOUL.md").display());
     Ok(())
 }
 
-/// Create a new sub-agent.
+// ─── Daemon ───────────────────────────────────────────────────────────────────
+
+async fn cmd_daemon() -> Result<()> {
+    let config = Arc::new(Config::load()?);
+    let daemon_cfg = daemon::DaemonConfig {
+        heartbeat_interval_secs: config.daemon.heartbeat_interval_secs,
+    };
+    daemon::run(config, daemon_cfg).await
+}
+
+// ─── Doctor ───────────────────────────────────────────────────────────────────
+
+async fn cmd_doctor() -> Result<()> {
+    let config = Config::load()?;
+    let report = doctor::run(&config).await?;
+    health::print_report(&report);
+    doctor::print_diagnostics(&config);
+    Ok(())
+}
+
+// ─── Update ───────────────────────────────────────────────────────────────────
+
+async fn cmd_update(check: bool, force: bool) -> Result<()> {
+    if check {
+        update::check().await
+    } else {
+        update::update(force).await
+    }
+}
+
+// ─── Cron ─────────────────────────────────────────────────────────────────────
+
+fn cmd_cron(sc: CronCommands) -> Result<()> {
+    let store = CronStore::new(&Config::data_dir().join("cron.db"))?;
+
+    match sc {
+        CronCommands::List => {
+            let tasks = store.list()?;
+            cron::print_tasks(&tasks);
+        }
+        CronCommands::Add { name, message, cron: cron_expr, every, at } => {
+            let (kind, schedule) = if let Some(expr) = cron_expr {
+                (TaskKind::Cron, expr)
+            } else if let Some(secs) = every {
+                (TaskKind::Interval, secs.to_string())
+            } else if let Some(ts) = at {
+                (TaskKind::Once, ts)
+            } else {
+                anyhow::bail!("Specify --cron, --every, or --at");
+            };
+            let task = store.add(&name, &message, kind, &schedule)?;
+            println!("✅ Task created: {}", task.id);
+        }
+        CronCommands::Enable { id } => {
+            let ok = store.set_enabled(&id, true)?;
+            println!("{}", if ok { "✅ Enabled" } else { "❌ Task not found" });
+        }
+        CronCommands::Disable { id } => {
+            let ok = store.set_enabled(&id, false)?;
+            println!("{}", if ok { "✅ Disabled" } else { "❌ Task not found" });
+        }
+        CronCommands::Remove { id } => {
+            let ok = store.delete(&id)?;
+            println!("{}", if ok { "✅ Removed" } else { "❌ Task not found" });
+        }
+    }
+    Ok(())
+}
+
+// ─── Goals ────────────────────────────────────────────────────────────────────
+
+fn cmd_goal(sc: GoalCommands) -> Result<()> {
+    let store = GoalStore::new(&Config::data_dir().join("goals.db"))?;
+
+    match sc {
+        GoalCommands::List { status } => {
+            let filter = status.and_then(|s| s.parse::<GoalStatus>().ok());
+            let goals = store.list(filter)?;
+            goals::print_goals(&goals);
+        }
+        GoalCommands::Add { title, description, priority } => {
+            let goal = store.add(&title, &description, priority)?;
+            println!("✅ Goal created: {}", goal.id);
+        }
+        GoalCommands::Complete { id } => {
+            let ok = store.update_status(&id, GoalStatus::Completed)?;
+            println!("{}", if ok { "✅ Completed" } else { "❌ Goal not found" });
+        }
+        GoalCommands::Cancel { id } => {
+            let ok = store.update_status(&id, GoalStatus::Cancelled)?;
+            println!("{}", if ok { "✅ Cancelled" } else { "❌ Goal not found" });
+        }
+        GoalCommands::Delete { id } => {
+            let ok = store.delete(&id)?;
+            println!("{}", if ok { "✅ Deleted" } else { "❌ Goal not found" });
+        }
+    }
+    Ok(())
+}
+
+// ─── Memory ───────────────────────────────────────────────────────────────────
+
+async fn cmd_memory(sc: MemoryCommands) -> Result<()> {
+    let config = Config::load()?;
+    let backend = MemoryBackend::from_str(&config.memory.backend).unwrap_or_default();
+    let data_dir = Config::data_dir();
+    let mem = memory::build_memory(&backend, &data_dir, &config.memory.embed_url, &config.memory.embed_model).await?;
+
+    let Some(mem) = mem else {
+        println!("Memory backend is 'none'. Enable it in config.toml [memory] backend = \"sqlite\".");
+        return Ok(());
+    };
+
+    match sc {
+        MemoryCommands::List { category, limit } => {
+            let entries = mem.recall(category.as_deref(), limit).await?;
+            if entries.is_empty() {
+                println!("No memories found.");
+            } else {
+                for e in &entries {
+                    println!("{} [{}] {}: {}", e.id, e.category, e.created_at.format("%Y-%m-%d %H:%M"), e.content);
+                }
+            }
+        }
+        MemoryCommands::Search { query, limit } => {
+            let entries = mem.search(&query, limit).await?;
+            if entries.is_empty() {
+                println!("No results.");
+            } else {
+                for e in &entries {
+                    println!("{} [{}] {}", e.id, e.category, e.content);
+                }
+            }
+        }
+        MemoryCommands::Forget { id } => {
+            let ok = mem.forget(&id).await?;
+            println!("{}", if ok { "✅ Deleted" } else { "❌ Entry not found" });
+        }
+        MemoryCommands::Clear { category, yes } => {
+            let confirmed = yes || dialoguer::Confirm::new()
+                .with_prompt(format!("Clear {}?", category.as_deref().unwrap_or("ALL memories")))
+                .default(false)
+                .interact()?;
+            if confirmed {
+                let n = mem.clear(category.as_deref()).await?;
+                println!("✅ Cleared {n} entries");
+            }
+        }
+        MemoryCommands::Stats => {
+            let stats = mem.stats().await?;
+            println!("Total entries: {}", stats.total);
+            println!("By category:");
+            let mut cats: Vec<_> = stats.by_category.iter().collect();
+            cats.sort_by_key(|(k, _)| k.as_str());
+            for (cat, count) in cats {
+                println!("  {cat}: {count}");
+            }
+        }
+    }
+    Ok(())
+}
+
+// ─── Service ──────────────────────────────────────────────────────────────────
+
+fn cmd_service(sc: ServiceCommands) -> Result<()> {
+    let bin = std::env::current_exe().context("Cannot determine binary path")?;
+    match sc {
+        ServiceCommands::Install => service::manage(ServiceAction::Install, &bin),
+        ServiceCommands::Uninstall => service::manage(ServiceAction::Uninstall, &bin),
+        ServiceCommands::Status => service::manage(ServiceAction::Status, &bin),
+    }
+}
+
+// ─── Create Agent ─────────────────────────────────────────────────────────────
+
 fn cmd_create_agent(name: &str, role: Option<&str>) -> Result<()> {
+    if name.is_empty() || name.contains(' ') {
+        anyhow::bail!("Agent name must be lowercase with no spaces");
+    }
     let config = Config::load()?;
     let souls_dir = config.souls_dir();
 
-    let agent_dir = souls_dir.join(name);
-    if agent_dir.exists() {
-        eprintln!("Agent '{}' already exists at: {}", name, agent_dir.display());
-        std::process::exit(1);
-    }
+    let identity = if let Some(r) = role {
+        let id = identity::AgentIdentity {
+            name: name.to_string(),
+            role: r.to_string(),
+            ..Default::default()
+        };
+        Some(id)
+    } else { None };
 
-    let custom_identity = role.map(|r| identity::AgentIdentity {
-        name: format!("OneClaw {}", capitalize(name)),
-        role: r.to_string(),
-        ..Default::default()
-    });
-
-    let path = identity::create_agent(&souls_dir, name, custom_identity, None)?;
-
-    println!("{}", console::style(format!("✅ Agent '{}' created!", name)).green().bold());
-    println!("   Soul folder: {}", path.display());
-    println!("   Edit identity.json and SOUL.md to customize behavior.");
-    println!();
-    println!("   To give it a dedicated model, add to your config:");
-    println!("   [providers.{}]", name);
-    println!("   kind = \"openrouter\"");
-    println!("   api_key = \"sk-...\"");
-    println!("   model = \"...\"");
-    println!();
-    println!("   Without a dedicated provider, it uses the main agent's model.");
-
+    let dir = identity::create_agent(&souls_dir, name, identity, None)?;
+    println!("✅ Agent '{}' created: {}", name, dir.display());
+    println!("   Edit {} to customize personality.", dir.join("SOUL.md").display());
+    println!("   Edit {} to describe tools/permissions.", dir.join("TOOLS.md").display());
+    println!("   Add a [providers.{}] section in config.toml to use a different model.", name);
     Ok(())
 }
 
-/// List all agents.
+// ─── List Agents ─────────────────────────────────────────────────────────────
+
 fn cmd_list_agents() -> Result<()> {
     let config = Config::load()?;
     let souls_dir = config.souls_dir();
@@ -472,50 +892,69 @@ fn cmd_list_agents() -> Result<()> {
 
     println!("{}", console::style("Agents:").bold());
     for name in &agents {
-        let (id, _) = identity::load_identity(&souls_dir, name)
-            .unwrap_or_default();
+        let files = identity::load_identity(&souls_dir, name).ok();
+        let role = files.as_ref().map(|f| f.identity.role.as_str()).unwrap_or("(unknown)");
         let has_provider = config.providers.contains_key(name);
         let provider_tag = if has_provider {
             let pc = &config.providers[name];
-            format!(" [{}]", pc.model)
+            format!(" [{} / {}]", pc.kind, pc.model)
         } else if name != "main" {
             " [falls back to main]".to_string()
-        } else {
-            String::new()
-        };
+        } else { String::new() };
         let main_tag = if name == "main" { " (router)" } else { "" };
-
-        println!("  • {}{main_tag}: {}{provider_tag}", name, id.role);
+        println!("  • {}{main_tag}: {}{provider_tag}", name, role);
     }
-
     Ok(())
 }
 
-/// Show status.
+// ─── Status ──────────────────────────────────────────────────────────────────
+
 fn cmd_status() -> Result<()> {
     let config_path = Config::default_path();
     println!("{}", console::style("OneClaw Status").bold().cyan());
     println!();
 
-    if config_path.exists() {
-        println!("Config: {}", config_path.display());
-        let config = Config::load()?;
-        println!("Workspace: {}", config.workspace_dir().display());
-        println!("Souls: {}", config.souls_dir().display());
-        println!();
-        cmd_list_agents()?;
+    let config = if config_path.exists() {
+        Config::from_file(&config_path)?
     } else {
-        println!("Config: {} (not found)", config_path.display());
-        println!("\nRun 'oneclaw onboard' to set up.");
+        println!("⚠️  No config found at {}", config_path.display());
+        println!("   Run 'oneclaw onboard' to get started.");
+        return Ok(());
+    };
+
+    println!("Config    : {}", config_path.display());
+    println!("Workspace : {}", config.workspace_dir().display());
+    println!("Agents    : {}", config.souls_dir().display());
+    println!("Memory    : {} (recall={})", config.memory.backend, config.memory.recall_limit);
+    println!("Heartbeat : {}s", config.daemon.heartbeat_interval_secs);
+    println!();
+
+    println!("Providers:");
+    for (name, p) in &config.providers {
+        println!("  [{name}] {} / {}", p.kind, p.model);
     }
+
+    println!();
+    println!("Agents:");
+    let souls_dir = config.souls_dir();
+    let agents = identity::discover_agents(&souls_dir);
+    for name in &agents {
+        println!("  • {name}");
+    }
+
+    println!();
+    println!("Channels:");
+    println!("  telegram : {}", if config.channels.telegram.is_some() { "configured" } else { "not configured" });
+    println!("  whatsapp : {}", if config.channels.whatsapp.is_some() { "configured" } else { "not configured" });
 
     Ok(())
 }
 
-fn capitalize(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        None => String::new(),
-        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-    }
+// ─── Health ──────────────────────────────────────────────────────────────────
+
+fn cmd_health() -> Result<()> {
+    let config = Config::load().unwrap_or_default();
+    let report = health::run_health_checks(&config)?;
+    health::print_report(&report);
+    Ok(())
 }

@@ -1,11 +1,18 @@
-// OpenRouter / OpenAI-compatible provider implementation.
+// OpenAI-compatible provider — for any server that speaks the OpenAI chat/completions API.
+//
+// Use this when you have a custom base_url pointing at:
+//   - a self-hosted vLLM / LiteLLM / LocalAI server
+//   - any other OpenAI-compatible inference endpoint
+//
+// Unlike the dedicated openai.rs this provider always requires an explicit
+// base_url in the config. If none is given it errors clearly.
 
 use super::{ConversationMessage, Provider, ProviderResponse, StreamChunk, Usage};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-pub struct OpenRouterProvider {
+pub struct CompatibleProvider {
     client: reqwest::Client,
     api_key: String,
     model: String,
@@ -13,19 +20,20 @@ pub struct OpenRouterProvider {
     name: String,
 }
 
-impl OpenRouterProvider {
-    pub fn new(api_key: &str, model: &str, base_url: Option<&str>, name: Option<&str>) -> Self {
+impl CompatibleProvider {
+    /// `base_url` — e.g. "http://localhost:8080/v1", "https://my-proxy.example.com/v1"
+    pub fn new(api_key: &str, model: &str, base_url: &str, name: Option<&str>) -> Self {
         Self {
             client: reqwest::Client::new(),
             api_key: api_key.to_string(),
             model: model.to_string(),
-            base_url: base_url
-                .unwrap_or("https://openrouter.ai/api/v1")
-                .to_string(),
-            name: name.unwrap_or("openrouter").to_string(),
+            base_url: base_url.trim_end_matches('/').to_string(),
+            name: name.unwrap_or("compatible").to_string(),
         }
     }
 }
+
+// ─── Request / Response ──────────────────────────────────────────────────────
 
 #[derive(Serialize)]
 struct ChatRequest {
@@ -36,7 +44,7 @@ struct ChatRequest {
     stream: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone)]
 struct ChatMessage {
     role: String,
     content: String,
@@ -73,8 +81,10 @@ struct ApiUsage {
     total_tokens: Option<u32>,
 }
 
+// ─── Provider implementation ─────────────────────────────────────────────────
+
 #[async_trait]
-impl Provider for OpenRouterProvider {
+impl Provider for CompatibleProvider {
     fn name(&self) -> &str {
         &self.name
     }
@@ -108,42 +118,38 @@ impl Provider for OpenRouterProvider {
             .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
-            .header("HTTP-Referer", "https://github.com/oneclaw/oneclaw")
-            .header("X-Title", "OneClaw")
             .json(&request_body)
             .send()
             .await
-            .context("Failed to send chat request")?;
+            .context("Failed to send request to compatible endpoint")?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Provider returned {status}: {error_text}");
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Compatible API error {status}: {body}");
         }
 
-        let chat_response: ChatResponse = response
+        let data: ChatResponse = response
             .json()
             .await
-            .context("Failed to parse chat response")?;
+            .context("Failed to parse compatible endpoint response")?;
 
-        let content = chat_response
+        let content = data
             .choices
-            .first()
-            .and_then(|c| c.message.as_ref())
-            .and_then(|m| m.content.clone())
+            .into_iter()
+            .next()
+            .and_then(|c| c.message)
+            .and_then(|m| m.content)
             .unwrap_or_default();
 
-        let usage = chat_response.usage.map(|u| Usage {
+        let model = data.model.unwrap_or_else(|| self.model.clone());
+        let usage = data.usage.map(|u| Usage {
             prompt_tokens: u.prompt_tokens.unwrap_or(0),
             completion_tokens: u.completion_tokens.unwrap_or(0),
             total_tokens: u.total_tokens.unwrap_or(0),
         });
 
-        Ok(ProviderResponse {
-            content,
-            model: chat_response.model.unwrap_or_else(|| self.model.clone()),
-            usage,
-        })
+        Ok(ProviderResponse { content, model, usage })
     }
 
     async fn chat_stream(
@@ -151,6 +157,8 @@ impl Provider for OpenRouterProvider {
         messages: &[ConversationMessage],
         temperature: Option<f64>,
     ) -> Result<tokio::sync::mpsc::Receiver<StreamChunk>> {
+        use futures_util::StreamExt;
+
         let chat_messages: Vec<ChatMessage> = messages
             .iter()
             .map(|m| ChatMessage {
@@ -171,74 +179,52 @@ impl Provider for OpenRouterProvider {
             .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
-            .header("HTTP-Referer", "https://github.com/oneclaw/oneclaw")
-            .header("X-Title", "OneClaw")
             .json(&request_body)
             .send()
             .await
-            .context("Failed to send streaming chat request")?;
+            .context("Failed to send streaming request to compatible endpoint")?;
 
-        let status = response.status();
-        if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Provider returned {status}: {error_text}");
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            anyhow::bail!("Compatible API error {status}: {body}");
         }
 
-        let (tx, rx) = tokio::sync::mpsc::channel(64);
+        let (tx, rx) = tokio::sync::mpsc::channel::<StreamChunk>(128);
+        let mut stream = response.bytes_stream();
 
         tokio::spawn(async move {
-            use futures_util::StreamExt;
-            let mut stream = response.bytes_stream();
-            let mut buffer = String::new();
-
             while let Some(chunk) = stream.next().await {
                 let bytes = match chunk {
                     Ok(b) => b,
                     Err(_) => break,
                 };
-
-                buffer.push_str(&String::from_utf8_lossy(&bytes));
-
-                // Process SSE lines
-                while let Some(line_end) = buffer.find('\n') {
-                    let line = buffer[..line_end].trim().to_string();
-                    buffer = buffer[line_end + 1..].to_string();
-
-                    if line.is_empty() || line.starts_with(':') {
-                        continue;
+                let text = String::from_utf8_lossy(&bytes);
+                for line in text.lines() {
+                    let data = line.strip_prefix("data: ").unwrap_or(line);
+                    if data == "[DONE]" {
+                        let _ = tx.send(StreamChunk { delta: String::new(), done: true }).await;
+                        return;
                     }
-
-                    if let Some(data) = line.strip_prefix("data: ") {
-                        if data.trim() == "[DONE]" {
-                            let _ = tx.send(StreamChunk {
-                                delta: String::new(),
-                                done: true,
-                            }).await;
-                            return;
-                        }
-
-                        if let Ok(parsed) = serde_json::from_str::<ChatResponse>(data) {
-                            if let Some(choice) = parsed.choices.first() {
-                                if let Some(delta) = &choice.delta {
-                                    if let Some(content) = &delta.content {
-                                        let _ = tx.send(StreamChunk {
-                                            delta: content.clone(),
-                                            done: false,
-                                        }).await;
-                                    }
-                                }
-                                if choice.finish_reason.is_some() {
-                                    let _ = tx.send(StreamChunk {
-                                        delta: String::new(),
-                                        done: true,
-                                    }).await;
-                                    return;
-                                }
-                            }
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
+                        if let Some(delta) = val
+                            .get("choices")
+                            .and_then(|c| c.get(0))
+                            .and_then(|c| c.get("delta"))
+                            .and_then(|d| d.get("content"))
+                            .and_then(|s| s.as_str())
+                        {
+                            let _ = tx
+                                .send(StreamChunk {
+                                    delta: delta.to_string(),
+                                    done: false,
+                                })
+                                .await;
                         }
                     }
                 }
             }
+            let _ = tx.send(StreamChunk { delta: String::new(), done: true }).await;
         });
 
         Ok(rx)

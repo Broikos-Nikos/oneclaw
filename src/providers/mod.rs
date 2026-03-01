@@ -4,7 +4,10 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-pub mod openrouter;
+pub mod anthropic;  // native Anthropic Messages API
+pub mod openai;     // native OpenAI chat completions
+pub mod ollama;     // local Ollama server
+pub mod compatible; // generic OpenAI-compatible endpoint (custom base_url required)
 
 /// A single message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]

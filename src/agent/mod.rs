@@ -11,6 +11,69 @@ use crate::providers::ConversationMessage;
 use crate::tools::Tool;
 use anyhow::Result;
 
+/// Run a message through any agent with full recursive delegation support.
+///
+/// Creates a fresh agent instance for the given name, runs the task, and
+/// if the agent delegates to another agent (via `transfer_to_agent`), builds
+/// that sub-agent, runs it, feeds results back, and loops until done.
+///
+/// `depth` prevents infinite delegation loops (max 4 levels).
+/// Use `is_main = true` only for the "main" agent.
+pub async fn run_agent_task(
+    config: &Config,
+    agent_name: &str,
+    task: &str,
+    is_main: bool,
+    depth: u32,
+) -> anyhow::Result<String> {
+    const MAX_DEPTH: u32 = 4;
+    if depth >= MAX_DEPTH {
+        tracing::warn!("Max delegation depth ({MAX_DEPTH}) reached at agent '{agent_name}'");
+        return Ok(format!("[Max delegation depth reached — unable to delegate further]"));
+    }
+
+    let workspace_dir = config.workspace_dir();
+    let souls_dir = config.souls_dir();
+    let available = crate::identity::discover_agents(&souls_dir);
+    let tools = crate::tools::core_tools(&workspace_dir);
+
+    let mut agent = Agent::from_config(config, agent_name, is_main, tools, &available)?;
+    let mut current = agent.turn(task).await?;
+
+    loop {
+        match current {
+            TurnResult::Response(text) => return Ok(text),
+            TurnResult::Transfer { target_agent, task: subtask } => {
+                tracing::info!("[{agent_name}] delegating to [{target_agent}]: {subtask}");
+                // Recursively run the sub-agent (depth+1 prevents infinite loops)
+                let sub_result = Box::pin(run_agent_task(
+                    config,
+                    &target_agent,
+                    &subtask,
+                    false,
+                    depth + 1,
+                ))
+                .await
+                .unwrap_or_else(|e| format!("[{target_agent} error: {e}]"));
+                // Feed sub-agent result back so main agent can continue
+                current = agent.continue_with_result(&target_agent, &sub_result).await?;
+            }
+        }
+    }
+}
+
+/// Result of a single agent turn — either a final response or a transfer request.
+#[derive(Debug)]
+pub enum TurnResult {
+    /// Agent produced a final response.
+    Response(String),
+    /// Agent wants to transfer a task to another agent.
+    Transfer {
+        target_agent: String,
+        task: String,
+    },
+}
+
 /// An Agent instance — holds provider, tools, history, and identity.
 pub struct Agent {
     /// Name of this agent (e.g. "main", "developer", "creative", or any user-defined name).
@@ -45,30 +108,56 @@ impl Agent {
                 )
             })?;
 
-        let provider = {
-            let base_url = match provider_config.kind.as_str() {
-                "openai" => provider_config.base_url.as_deref()
-                    .unwrap_or("https://api.openai.com/v1"),
-                "anthropic" => provider_config.base_url.as_deref()
-                    .unwrap_or("https://api.anthropic.com/v1"),
-                "openrouter" | _ => provider_config.base_url.as_deref()
-                    .unwrap_or("https://openrouter.ai/api/v1"),
-            };
-            crate::providers::openrouter::OpenRouterProvider::new(
-                &provider_config.api_key,
-                &provider_config.model,
-                Some(base_url),
-                Some(agent_name),
-            )
+        let provider: Box<dyn crate::providers::Provider> = match provider_config.kind.as_str() {
+            "anthropic" => {
+                Box::new(crate::providers::anthropic::AnthropicProvider::new(
+                    &provider_config.api_key,
+                    &provider_config.model,
+                    provider_config.base_url.as_deref(),
+                    Some(agent_name),
+                ))
+            }
+            "openai" => {
+                // Native OpenAI API (api.openai.com)
+                Box::new(crate::providers::openai::OpenAIProvider::new(
+                    &provider_config.api_key,
+                    &provider_config.model,
+                    provider_config.base_url.as_deref(),
+                    Some(agent_name),
+                ))
+            }
+            "ollama" => {
+                Box::new(crate::providers::ollama::OllamaProvider::new(
+                    &provider_config.model,
+                    provider_config.base_url.as_deref(),
+                    Some(agent_name),
+                ))
+            }
+            kind => {
+                // "compatible" or any unknown kind → OpenAI-compatible endpoint
+                // base_url MUST be set in config for this path.
+                let base_url = provider_config.base_url.as_deref().unwrap_or_else(|| {
+                    tracing::warn!(
+                        "Provider kind '{}' requires base_url in config — defaulting to localhost:8080",
+                        kind
+                    );
+                    "http://localhost:8080/v1"
+                });
+                Box::new(crate::providers::compatible::CompatibleProvider::new(
+                    &provider_config.api_key,
+                    &provider_config.model,
+                    base_url,
+                    Some(agent_name),
+                ))
+            }
         };
 
         let souls_dir = config.souls_dir();
-        let (agent_identity, soul) = identity::load_identity(&souls_dir, agent_name)?;
+        let agent_files = identity::load_identity(&souls_dir, agent_name)?;
 
         // Build system prompt
         let mut system_prompt = prompt::build_system_prompt(
-            &agent_identity,
-            &soul,
+            &agent_files,
             &tools,
             &config.workspace_dir(),
             &provider_config.model,
@@ -91,7 +180,7 @@ impl Agent {
         Ok(Self {
             name: agent_name.to_string(),
             is_main,
-            provider: Box::new(provider),
+            provider,
             tools,
             history: Vec::new(),
             system_prompt,
@@ -111,7 +200,9 @@ impl Agent {
     }
 
     /// Run a single turn: send a user message, handle tool calls, return final response.
-    pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+    /// If the agent uses transfer_to_agent, returns TurnResult::Transfer so the caller
+    /// can execute the sub-agent and feed the result back.
+    pub async fn turn(&mut self, user_message: &str) -> Result<TurnResult> {
         self.history.push(ConversationMessage {
             role: "user".into(),
             content: user_message.to_string(),
@@ -152,13 +243,29 @@ impl Agent {
                     role: "assistant".into(),
                     content: content.clone(),
                 });
-                return Ok(content.clone());
+                return Ok(TurnResult::Response(content.clone()));
             }
 
             // Execute each tool call and collect results
             let mut tool_results = String::new();
             for call in &tool_calls {
                 let result = dispatcher::execute_tool_call(call, &self.tools).await;
+
+                // Check for transfer_to_agent marker
+                if result.success && result.output.starts_with("[TRANSFER_PENDING:") {
+                    if let Some(transfer) = parse_transfer_marker(&result.output) {
+                        // Save the assistant message that requested the transfer
+                        self.history.push(ConversationMessage {
+                            role: "assistant".into(),
+                            content: content.clone(),
+                        });
+                        return Ok(TurnResult::Transfer {
+                            target_agent: transfer.0,
+                            task: transfer.1,
+                        });
+                    }
+                }
+
                 tool_results.push_str(&format!(
                     "<tool_result name=\"{}\">\n{}\n</tool_result>\n\n",
                     call.name,
@@ -190,7 +297,94 @@ impl Agent {
             });
         }
 
-        Ok("[Agent reached maximum tool iterations]".into())
+        Ok(TurnResult::Response("[Agent reached maximum tool iterations]".into()))
+    }
+
+    /// Continue a turn after receiving a sub-agent result.
+    /// Feeds the sub-agent's response back as a tool result and continues the conversation.
+    pub async fn continue_with_result(&mut self, agent_name: &str, result: &str) -> Result<TurnResult> {
+        let tool_result_msg = format!(
+            "<tool_result name=\"transfer_to_agent\">\nAgent '{agent_name}' completed the task:\n\n{result}\n</tool_result>"
+        );
+
+        // Feed the sub-agent result back
+        self.history.push(ConversationMessage {
+            role: "user".into(),
+            content: format!("Tool results:\n\n{tool_result_msg}"),
+        });
+
+        self.trim_history();
+
+        let mut messages = vec![ConversationMessage {
+            role: "system".into(),
+            content: self.system_prompt.clone(),
+        }];
+        messages.extend(self.history.clone());
+
+        let mut iterations = 0;
+        let max_iterations = 10;
+
+        loop {
+            iterations += 1;
+            if iterations > max_iterations {
+                break;
+            }
+
+            let response = self.provider.chat(&messages, Some(self.temperature)).await?;
+            let content = &response.content;
+            let tool_calls = dispatcher::parse_tool_calls(content);
+
+            if tool_calls.is_empty() {
+                self.history.push(ConversationMessage {
+                    role: "assistant".into(),
+                    content: content.clone(),
+                });
+                return Ok(TurnResult::Response(content.clone()));
+            }
+
+            let mut tool_results = String::new();
+            for call in &tool_calls {
+                let result = dispatcher::execute_tool_call(call, &self.tools).await;
+
+                if result.success && result.output.starts_with("[TRANSFER_PENDING:") {
+                    if let Some(transfer) = parse_transfer_marker(&result.output) {
+                        self.history.push(ConversationMessage {
+                            role: "assistant".into(),
+                            content: content.clone(),
+                        });
+                        return Ok(TurnResult::Transfer {
+                            target_agent: transfer.0,
+                            task: transfer.1,
+                        });
+                    }
+                }
+
+                tool_results.push_str(&format!(
+                    "<tool_result name=\"{}\">\n{}\n</tool_result>\n\n",
+                    call.name,
+                    if result.success { &result.output } else { result.error.as_deref().unwrap_or("Unknown error") }
+                ));
+            }
+
+            messages.push(ConversationMessage {
+                role: "assistant".into(),
+                content: content.clone(),
+            });
+            messages.push(ConversationMessage {
+                role: "user".into(),
+                content: format!("Tool results:\n\n{tool_results}"),
+            });
+            self.history.push(ConversationMessage {
+                role: "assistant".into(),
+                content: content.clone(),
+            });
+            self.history.push(ConversationMessage {
+                role: "user".into(),
+                content: format!("Tool results:\n\n{tool_results}"),
+            });
+        }
+
+        Ok(TurnResult::Response("[Agent reached maximum tool iterations]".into()))
     }
 
     fn trim_history(&mut self) {
@@ -263,11 +457,52 @@ impl Tool for TransferTool {
 
         // Return a marker — the actual delegation is handled by the caller
         // who has access to all agent instances.
-        // For now, return a pending marker that the main loop recognizes.
         Ok(crate::tools::ToolResult {
             success: true,
             output: format!("[TRANSFER_PENDING:{}] {}", agent_name, task),
             error: None,
         })
+    }
+}
+
+/// Parse a `[TRANSFER_PENDING:agent_name] task description` marker.
+/// Returns (agent_name, task) if the marker is valid.
+fn parse_transfer_marker(output: &str) -> Option<(String, String)> {
+    let rest = output.strip_prefix("[TRANSFER_PENDING:")?;
+    let end_bracket = rest.find(']')?;
+    let agent_name = rest[..end_bracket].trim().to_string();
+    let task = rest[end_bracket + 1..].trim().to_string();
+    if agent_name.is_empty() || task.is_empty() {
+        return None;
+    }
+    Some((agent_name, task))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_transfer_marker_valid() {
+        let output = "[TRANSFER_PENDING:developer] Write the homepage HTML";
+        let result = parse_transfer_marker(output);
+        assert_eq!(
+            result,
+            Some(("developer".to_string(), "Write the homepage HTML".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_transfer_marker_empty_task() {
+        let output = "[TRANSFER_PENDING:developer] ";
+        let result = parse_transfer_marker(output);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn parse_transfer_marker_invalid() {
+        let output = "Some random tool output";
+        let result = parse_transfer_marker(output);
+        assert_eq!(result, None);
     }
 }

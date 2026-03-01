@@ -1,5 +1,4 @@
 // OneClaw configuration system.
-// Agents are dynamic — users create them. Only "main" is required.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -7,9 +6,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Top-level config.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Config {
-    /// Provider configs keyed by agent name (e.g. "main", "developer", "creative").
+    /// Provider configs keyed by agent name (e.g. "main", "developer").
     /// Each agent can have its own provider/model, or share with another.
     #[serde(default)]
     pub providers: HashMap<String, ProviderConfig>,
@@ -19,12 +18,20 @@ pub struct Config {
     pub agents: AgentsConfig,
     #[serde(default)]
     pub channels: ChannelsConfig,
+    #[serde(default)]
+    pub memory: MemoryConfig,
+    #[serde(default)]
+    pub hooks: Vec<HookConfig>,
+    #[serde(default)]
+    pub daemon: DaemonConfig,
 }
 
 /// Provider configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
+    /// "anthropic", "openai", "ollama", or any OpenAI-compatible kind
     pub kind: String,
+    #[serde(default)]
     pub api_key: String,
     pub model: String,
     #[serde(default)]
@@ -33,9 +40,7 @@ pub struct ProviderConfig {
     pub temperature: f64,
 }
 
-fn default_temperature() -> f64 {
-    0.7
-}
+fn default_temperature() -> f64 { 0.7 }
 
 /// Workspace configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,16 +50,10 @@ pub struct WorkspaceConfig {
 }
 
 impl Default for WorkspaceConfig {
-    fn default() -> Self {
-        Self {
-            path: default_workspace_path(),
-        }
-    }
+    fn default() -> Self { Self { path: default_workspace_path() } }
 }
 
-fn default_workspace_path() -> String {
-    "~/.oneclaw/workspace".to_string()
-}
+fn default_workspace_path() -> String { "~/.oneclaw/workspace".to_string() }
 
 /// Agents configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,15 +63,68 @@ pub struct AgentsConfig {
 }
 
 impl Default for AgentsConfig {
+    fn default() -> Self { Self { souls_dir: default_souls_dir() } }
+}
+
+fn default_souls_dir() -> String { "~/.oneclaw/agents".to_string() }
+
+/// Memory configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryConfig {
+    /// Backend: sqlite (default), markdown, vector, none
+    #[serde(default = "default_memory_backend")]
+    pub backend: String,
+    /// Embedding URL for vector backend (default: Ollama localhost)
+    #[serde(default = "default_embed_url")]
+    pub embed_url: String,
+    /// Embedding model (default: nomic-embed-text)
+    #[serde(default = "default_embed_model")]
+    pub embed_model: String,
+    /// How many recent memories to inject into each prompt
+    #[serde(default = "default_recall_limit")]
+    pub recall_limit: usize,
+}
+
+fn default_memory_backend() -> String { "sqlite".to_string() }
+fn default_embed_url() -> String { "http://localhost:11434".to_string() }
+fn default_embed_model() -> String { "nomic-embed-text".to_string() }
+fn default_recall_limit() -> usize { 10 }
+
+impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
-            souls_dir: default_souls_dir(),
+            backend: default_memory_backend(),
+            embed_url: default_embed_url(),
+            embed_model: default_embed_model(),
+            recall_limit: default_recall_limit(),
         }
     }
 }
 
-fn default_souls_dir() -> String {
-    "~/.oneclaw/agents".to_string()
+/// A lifecycle hook.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HookConfig {
+    pub name: String,
+    /// "pre-tool" or "post-tool"
+    pub phase: Option<String>,
+    /// Tool name filter ("*" or specific tool name)
+    #[serde(default)]
+    pub tool_filter: Option<String>,
+    /// Shell command to run
+    pub command: String,
+}
+
+/// Daemon configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonConfig {
+    #[serde(default = "default_heartbeat_secs")]
+    pub heartbeat_interval_secs: u64,
+}
+
+fn default_heartbeat_secs() -> u64 { 60 }
+
+impl Default for DaemonConfig {
+    fn default() -> Self { Self { heartbeat_interval_secs: default_heartbeat_secs() } }
 }
 
 /// Channels configuration.
@@ -92,9 +144,7 @@ pub struct TelegramConfig {
     pub allowed_users: Vec<String>,
 }
 
-fn default_allowed_users() -> Vec<String> {
-    vec!["*".to_string()]
-}
+fn default_allowed_users() -> Vec<String> { vec!["*".to_string()] }
 
 /// WhatsApp Business Cloud API channel configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,39 +159,26 @@ pub struct WhatsAppConfig {
     pub webhook_port: u16,
 }
 
-fn default_verify_token() -> String {
-    "oneclaw-verify".to_string()
-}
-
-fn default_allowed_numbers() -> Vec<String> {
-    vec!["*".to_string()]
-}
-
-fn default_webhook_port() -> u16 {
-    8443
-}
+fn default_verify_token() -> String { "oneclaw-verify".to_string() }
+fn default_allowed_numbers() -> Vec<String> { vec!["*".to_string()] }
+fn default_webhook_port() -> u16 { 8443 }
 
 impl Config {
-    /// Load config from the default path.
     pub fn load() -> Result<Self> {
         let config_path = Self::default_path();
         if config_path.exists() {
             Self::from_file(&config_path)
         } else {
-            Ok(Self::default_config())
+            Ok(Self::default())
         }
     }
 
-    /// Load config from a specific file.
     pub fn from_file(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)
             .with_context(|| format!("Failed to read config: {}", path.display()))?;
-        let config: Config =
-            toml::from_str(&content).with_context(|| "Failed to parse config TOML")?;
-        Ok(config)
+        toml::from_str(&content).with_context(|| "Failed to parse config TOML")
     }
 
-    /// Save config to the default path.
     pub fn save(&self) -> Result<()> {
         let path = Self::default_path();
         if let Some(parent) = path.parent() {
@@ -152,44 +189,31 @@ impl Config {
         Ok(())
     }
 
-    /// Default config file path.
     pub fn default_path() -> PathBuf {
         let dirs = directories::ProjectDirs::from("", "", "oneclaw")
             .expect("Failed to determine config directory");
         dirs.config_dir().join("config.toml")
     }
 
-    /// Resolve workspace path.
     pub fn workspace_dir(&self) -> PathBuf {
-        let expanded = shellexpand::tilde(&self.workspace.path);
-        PathBuf::from(expanded.to_string())
+        PathBuf::from(shellexpand::tilde(&self.workspace.path).to_string())
     }
 
-    /// Resolve souls directory path.
     pub fn souls_dir(&self) -> PathBuf {
-        let expanded = shellexpand::tilde(&self.agents.souls_dir);
-        PathBuf::from(expanded.to_string())
+        PathBuf::from(shellexpand::tilde(&self.agents.souls_dir).to_string())
     }
 
-    /// Get provider config for a named agent.
-    /// Falls back to "main" if no specific config exists for the requested agent.
+    /// Data directory for databases (cron, goals, coordination, memory).
+    pub fn data_dir() -> PathBuf {
+        let dirs = directories::ProjectDirs::from("", "", "oneclaw")
+            .expect("Failed to determine data directory");
+        dirs.data_local_dir().to_path_buf()
+    }
+
     pub fn provider_for(&self, agent_name: &str) -> Option<&ProviderConfig> {
-        self.providers
-            .get(agent_name)
-            .or_else(|| self.providers.get("main"))
+        self.providers.get(agent_name).or_else(|| self.providers.get("main"))
     }
 
-    /// Generate a default config (no providers configured).
-    pub fn default_config() -> Self {
-        Config {
-            providers: HashMap::new(),
-            workspace: WorkspaceConfig::default(),
-            agents: AgentsConfig::default(),
-            channels: ChannelsConfig::default(),
-        }
-    }
-
-    /// Generate a sample config TOML string.
     pub fn sample_toml() -> String {
         r#"# OneClaw Configuration
 #
@@ -200,32 +224,43 @@ impl Config {
 # The "main" agent is required. It routes tasks to sub-agents.
 # Sub-agents without a specific provider config fall back to "main".
 
+# ── Anthropic (direct API) ─────────────────────────────────────
 [providers.main]
-kind = "openrouter"
-api_key = "sk-or-v1-YOUR_KEY_HERE"
-model = "anthropic/claude-sonnet-4-20250514"
+kind = "anthropic"
+api_key = "sk-ant-YOUR_KEY_HERE"
+model = "claude-sonnet-4-20250514"
 temperature = 0.7
 
-# Example: a developer agent with a different model
+# ── OpenAI (direct API) ────────────────────────────────────────
+# [providers.main]
+# kind = "openai"
+# api_key = "sk-YOUR_KEY_HERE"
+# model = "gpt-4o"
+# temperature = 0.7
+
+# ── Ollama (local, no API key) ─────────────────────────────────
+# [providers.main]
+# kind = "ollama"
+# model = "llama3.2"
+# base_url = "http://localhost:11434"    # default, can omit
+# temperature = 0.7
+
+# ── OpenAI-compatible custom endpoint ─────────────────────────
+# [providers.main]
+# kind = "compatible"
+# api_key = "YOUR_KEY_OR_EMPTY"
+# model = "your-model-name"
+# base_url = "http://your-server/v1"    # REQUIRED for compatible kind
+# temperature = 0.7
+
+# ── Sub-agent example ─────────────────────────────────────────
 # [providers.developer]
-# kind = "openrouter"
-# api_key = "sk-or-v1-YOUR_KEY_HERE"
-# model = "anthropic/claude-sonnet-4-20250514"
+# kind = "anthropic"
+# api_key = "sk-ant-YOUR_KEY_HERE"
+# model = "claude-sonnet-4-20250514"
 # temperature = 0.3
 
-# Example: a creative agent with higher temperature
-# [providers.creative]
-# kind = "openrouter"
-# api_key = "sk-or-v1-YOUR_KEY_HERE"
-# model = "anthropic/claude-sonnet-4-20250514"
-# temperature = 0.9
-
-# Example: a cheap/fast agent for simple tasks
-# [providers.quick]
-# kind = "openrouter"
-# api_key = "sk-or-v1-YOUR_KEY_HERE"
-# model = "meta-llama/llama-3.3-70b-instruct"
-# temperature = 0.5
+# Each sub-agent without its own [providers.<name>] falls back to [providers.main].
 
 [workspace]
 path = "~/.oneclaw/workspace"
@@ -233,24 +268,47 @@ path = "~/.oneclaw/workspace"
 [agents]
 souls_dir = "~/.oneclaw/agents"
 
+# ── Memory ─────────────────────────────────────────────────────
+# backend: sqlite (default) | markdown | vector | none
+#   sqlite   -- SQLite, fast keyword search
+#   markdown -- one .md file per entry, human-readable
+#   vector   -- SQLite + Ollama embeddings, semantic similarity search
+#   none     -- memory disabled
+[memory]
+backend = "sqlite"
+recall_limit = 10
+# For vector backend (semantic search via local Ollama):
+# embed_url   = "http://localhost:11434"
+# embed_model = "nomic-embed-text"
+
+# ── Daemon ─────────────────────────────────────────────────────
+[daemon]
+heartbeat_interval_secs = 60
+
 # ── Communication Channels ─────────────────────────────────────
-# Channels let you interact with OneClaw via messaging platforms.
-# Each channel runs alongside the CLI — you can use both.
 
-# Telegram: create a bot via @BotFather and paste the token.
+# Telegram — create a bot via @BotFather, paste the token.
+# Long-polling only, no public URL required.
 # [channels.telegram]
-# bot_token = "123456:ABCdef-YOUR_TOKEN"
-# allowed_users = ["*"]  # or ["your_username", "123456789"]
+# bot_token     = "123456:ABCdef-YOUR_TOKEN"
+# allowed_users = ["*"]  # or ["your_username", "numeric_id"]
 
-# WhatsApp: requires Meta Business account and WhatsApp Cloud API credentials.
-# You must expose webhook_port publicly (ngrok, Cloudflare Tunnel, etc.)
-# and configure the URL in Meta's WhatsApp Business dashboard.
+# WhatsApp — requires Meta Business account + WhatsApp Cloud API credentials.
+# A public HTTPS URL is needed for the webhook (use ngrok during dev).
 # [channels.whatsapp]
-# access_token = "YOUR_META_ACCESS_TOKEN"
+# access_token    = "YOUR_META_ACCESS_TOKEN"
 # phone_number_id = "YOUR_PHONE_NUMBER_ID"
-# verify_token = "oneclaw-verify"      # must match Meta webhook config
-# allowed_numbers = ["*"]              # or ["+1234567890"]
-# webhook_port = 8443                  # local port for webhook server
+# verify_token    = "oneclaw-verify"
+# allowed_numbers = ["*"]    # or ["+12125551234"]
+# webhook_port    = 8443
+
+# ── Hooks ─────────────────────────────────────────────────────
+# Run shell commands before/after tool execution.
+# [[hooks]]
+# name        = "log-tool"
+# phase       = "pre-tool"
+# tool_filter = "*"
+# command     = "echo \"Tool: $ONECLAW_TOOL\" >> ~/.oneclaw/tool.log"
 "#
         .to_string()
     }

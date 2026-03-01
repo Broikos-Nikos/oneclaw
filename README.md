@@ -46,16 +46,45 @@ cp target/release/oneclaw ~/.cargo/bin/
 ## Quick Start
 
 ```bash
-# 1. Set up the main agent
+# 1. Set up the main routing agent + optional channels
 oneclaw onboard
 
-# 2. Create sub-agents
+# 2. Create specialist sub-agents (optional but recommended)
 oneclaw create-agent developer --role "Software engineer"
-oneclaw create-agent creative --role "Writer and content creator"
-oneclaw create-agent quick --role "Fast responder for simple tasks"
+oneclaw create-agent creative  --role "Writer and content creator"
+oneclaw create-agent analyst   --role "Data analyst and researcher"
 
-# 3. Start chatting
+# 3. Start chatting (CLI)
 oneclaw agent
+
+# 4. Or start the background daemon (Telegram / WhatsApp listener)
+oneclaw daemon
+```
+
+## Multi-Agent Delegation
+
+When the main agent decides to delegate, it:
+1. Calls `transfer_to_agent` with the sub-agent name and task description.
+2. OneClaw spins up the named sub-agent and runs the task.
+3. The sub-agent's result is fed back to the main agent via `continue_with_result`.
+4. The main agent synthesizes all results and responds to the user.
+
+This loop continues (up to 4 levels deep) until the main agent returns a final response.
+
+```
+User → Main agent → transfer_to_agent("developer", "write the API")
+                         ↓
+                    Developer agent runs, outputs code
+                         ↓
+     Main agent ← sub-agent result (fed back automatically)
+         ↓
+     Main agent → transfer_to_agent("analyst", "review the code")
+                         ↓
+                    Analyst agent reviews, outputs report
+                         ↓
+     Main agent ← sub-agent result
+         ↓
+     Main agent → final response to user (synthesized)
 ```
 
 ## Commands
@@ -65,39 +94,135 @@ oneclaw agent
 | `oneclaw agent` | Interactive chat session |
 | `oneclaw agent -m "message"` | Single-shot message |
 | `oneclaw agent --agent developer -m "fix the bug"` | Force a specific agent |
-| `oneclaw onboard` | Initial setup (config + main agent) |
+| `oneclaw onboard` | Initial setup (config + main agent + channels) |
 | `oneclaw create-agent <name>` | Create a new sub-agent |
 | `oneclaw list-agents` | List all configured agents |
+| `oneclaw daemon` | Start background daemon (channels + cron + heartbeat) |
 | `oneclaw status` | Show configuration and agents |
+| `oneclaw doctor` | Run diagnostics |
 | `oneclaw sample-config` | Print sample config TOML |
-
-### Interactive Commands
-
-| Command | Description |
-|---|---|
-| `/agent <name>` | Force routing to a specific agent |
-| `/agent auto` | Return to automatic routing |
-| `/agents` | List available agents |
-| `/clear` | Clear conversation history |
-| `/quit` | Exit |
 
 ## Configuration
 
 Config lives at `~/.config/oneclaw/config.toml`:
 
 ```toml
-# The main agent is required
+# Main agent (required)
 [providers.main]
-kind = "openrouter"
-api_key = "sk-or-v1-YOUR_KEY"
-model = "anthropic/claude-sonnet-4-20250514"
+kind = "anthropic"
+api_key = "sk-ant-YOUR_KEY"
+model = "claude-sonnet-4-20250514"
 temperature = 0.7
 
 # Sub-agents can have their own provider/model
 [providers.developer]
-kind = "openrouter"
-api_key = "sk-or-v1-YOUR_KEY"
-model = "anthropic/claude-sonnet-4-20250514"
+kind = "openai"
+api_key = "sk-YOUR_OPENAI_KEY"
+model = "gpt-4o"
+temperature = 0.3
+
+# Or use a local model for a fast cheap sub-agent
+[providers.quick]
+kind = "ollama"
+model = "llama3.2"
+temperature = 0.5
+
+[workspace]
+path = "~/.oneclaw/workspace"
+
+[agents]
+souls_dir = "~/.oneclaw/agents"
+```
+
+Sub-agents without a `[providers.<name>]` section fall back to the main agent's provider.
+
+### Provider Kinds
+
+| Kind | Notes |
+|------|-------|
+| `anthropic` | Direct Anthropic API (Claude models) |
+| `openai` | Direct OpenAI API (GPT-4o, o3-mini, etc.) |
+| `ollama` | Local Ollama server (no API key needed) |
+| `compatible` | Any OpenAI-compatible endpoint — set `base_url` |
+
+## Channels
+
+OneClaw supports Telegram and WhatsApp alongside the CLI. The daemon receives
+messages, runs the full agent + delegation loop, and **replies back** to the user
+in the same channel thread.
+
+```toml
+# Telegram — simple long-polling bot, no public URL needed
+[channels.telegram]
+bot_token = "123456:ABCdef-YOUR_TOKEN"  # from @BotFather on Telegram
+allowed_users = ["*"]                   # or ["your_username"]
+
+# WhatsApp — Meta Business Cloud API (requires public HTTPS webhook)
+[channels.whatsapp]
+access_token  = "YOUR_META_ACCESS_TOKEN"
+phone_number_id = "YOUR_PHONE_NUMBER_ID"
+verify_token  = "your-secret-string"
+allowed_numbers = ["*"]                 # or ["+12125551234"]
+webhook_port  = 8443
+```
+
+**Telegram setup:** message @BotFather → `/newbot` → copy the token.
+
+**WhatsApp setup:**
+1. Create a Meta app at https://developers.facebook.com/apps/
+2. Enable WhatsApp Business API.
+3. Set webhook URL to `https://<your-domain>:<port>/webhook` (needs public HTTPS).
+4. Use ngrok or Cloudflare Tunnel during development.
+5. Run `oneclaw daemon` to start the listener.
+
+## Agent Souls
+
+Each agent has a soul folder at `~/.oneclaw/agents/<name>/`:
+
+```
+~/.oneclaw/agents/
+└── main/
+    ├── identity.json    # Name, role, personality, instructions
+    ├── SOUL.md          # Behavioral guidelines (free-form markdown)
+    ├── USER.md          # User profile and preferences
+    ├── TOOLS.md         # Tool permissions and limitations
+    └── AGENTS.md        # Operational safety rules
+```
+
+The `identity.json` format:
+
+```json
+{
+  "name": "OneClaw Developer",
+  "role": "Software engineer and architect",
+  "personality": "Precise, methodical, detail-oriented",
+  "instructions": [
+    "Write production-quality code with tests",
+    "Read existing files before modifying them",
+    "Verify changes with the shell tool"
+  ],
+  "strengths": ["Coding", "Debugging", "Architecture"],
+  "style": "Technical and precise"
+}
+```
+
+## Architecture Differences from ZeroClaw
+
+| | ZeroClaw | OneClaw |
+|---|---|---|
+| **Agents** | Single agent | Multi-agent with router + delegation |
+| **Delegation** | None | Main → sub → result fed back → loop |
+| **Channels** | 25+ platforms | Telegram + WhatsApp |
+| **Channel replies** | Supported | Replies back via same channel |
+| **Providers** | OpenRouter only | Anthropic, OpenAI, Ollama, compatible endpoint |
+| **Hardware** | GPIO, STM32, USB | Removed |
+| **WASM plugins** | Supported | Removed |
+| **Dependencies** | ~60 crates | ~20 crates |
+
+## License
+
+MIT OR Apache-2.0
+
 temperature = 0.3
 
 # Or use a cheaper model for simple tasks

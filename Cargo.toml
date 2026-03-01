@@ -4,9 +4,9 @@ version = "0.1.0"
 edition = "2021"
 authors = ["OneClaw Contributors"]
 license = "MIT OR Apache-2.0"
-description = "Multi-agent AI assistant with router architecture. Fork of ZeroClaw."
+description = "Multi-agent AI assistant — local-first, multi-provider, fully autonomous."
 readme = "README.md"
-keywords = ["ai", "agent", "cli", "multi-agent", "router"]
+keywords = ["ai", "agent", "cli", "multi-agent", "ollama"]
 categories = ["command-line-utilities", "api-bindings"]
 
 [dependencies]
@@ -14,7 +14,10 @@ categories = ["command-line-utilities", "api-bindings"]
 clap = { version = "4.5", features = ["derive"] }
 
 # Async runtime
-tokio = { version = "1.42", default-features = false, features = ["rt-multi-thread", "macros", "time", "net", "io-util", "sync", "process", "io-std", "fs", "signal"] }
+tokio = { version = "1.42", default-features = false, features = [
+    "rt-multi-thread", "macros", "time", "net", "io-util",
+    "sync", "process", "io-std", "fs", "signal",
+] }
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
@@ -71,6 +74,9 @@ futures-util = { version = "0.3", default-features = false, features = ["sink"] 
 
 # Base64
 base64 = "0.22"
+
+# Cron expression parsing
+cron = "0.12"
 
 [profile.release]
 opt-level = "z"
