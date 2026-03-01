@@ -17,6 +17,8 @@ pub struct Config {
     pub workspace: WorkspaceConfig,
     #[serde(default)]
     pub agents: AgentsConfig,
+    #[serde(default)]
+    pub channels: ChannelsConfig,
 }
 
 /// Provider configuration.
@@ -71,6 +73,52 @@ impl Default for AgentsConfig {
 
 fn default_souls_dir() -> String {
     "~/.oneclaw/agents".to_string()
+}
+
+/// Channels configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ChannelsConfig {
+    #[serde(default)]
+    pub telegram: Option<TelegramConfig>,
+    #[serde(default)]
+    pub whatsapp: Option<WhatsAppConfig>,
+}
+
+/// Telegram channel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelegramConfig {
+    pub bot_token: String,
+    #[serde(default = "default_allowed_users")]
+    pub allowed_users: Vec<String>,
+}
+
+fn default_allowed_users() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+/// WhatsApp Business Cloud API channel configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WhatsAppConfig {
+    pub access_token: String,
+    pub phone_number_id: String,
+    #[serde(default = "default_verify_token")]
+    pub verify_token: String,
+    #[serde(default = "default_allowed_numbers")]
+    pub allowed_numbers: Vec<String>,
+    #[serde(default = "default_webhook_port")]
+    pub webhook_port: u16,
+}
+
+fn default_verify_token() -> String {
+    "oneclaw-verify".to_string()
+}
+
+fn default_allowed_numbers() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+fn default_webhook_port() -> u16 {
+    8443
 }
 
 impl Config {
@@ -137,6 +185,7 @@ impl Config {
             providers: HashMap::new(),
             workspace: WorkspaceConfig::default(),
             agents: AgentsConfig::default(),
+            channels: ChannelsConfig::default(),
         }
     }
 
@@ -183,6 +232,25 @@ path = "~/.oneclaw/workspace"
 
 [agents]
 souls_dir = "~/.oneclaw/agents"
+
+# ── Communication Channels ─────────────────────────────────────
+# Channels let you interact with OneClaw via messaging platforms.
+# Each channel runs alongside the CLI — you can use both.
+
+# Telegram: create a bot via @BotFather and paste the token.
+# [channels.telegram]
+# bot_token = "123456:ABCdef-YOUR_TOKEN"
+# allowed_users = ["*"]  # or ["your_username", "123456789"]
+
+# WhatsApp: requires Meta Business account and WhatsApp Cloud API credentials.
+# You must expose webhook_port publicly (ngrok, Cloudflare Tunnel, etc.)
+# and configure the URL in Meta's WhatsApp Business dashboard.
+# [channels.whatsapp]
+# access_token = "YOUR_META_ACCESS_TOKEN"
+# phone_number_id = "YOUR_PHONE_NUMBER_ID"
+# verify_token = "oneclaw-verify"      # must match Meta webhook config
+# allowed_numbers = ["*"]              # or ["+1234567890"]
+# webhook_port = 8443                  # local port for webhook server
 "#
         .to_string()
     }

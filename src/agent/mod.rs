@@ -45,12 +45,22 @@ impl Agent {
                 )
             })?;
 
-        let provider = crate::providers::openrouter::OpenRouterProvider::new(
-            &provider_config.api_key,
-            &provider_config.model,
-            provider_config.base_url.as_deref(),
-            Some(agent_name),
-        );
+        let provider = {
+            let base_url = match provider_config.kind.as_str() {
+                "openai" => provider_config.base_url.as_deref()
+                    .unwrap_or("https://api.openai.com/v1"),
+                "anthropic" => provider_config.base_url.as_deref()
+                    .unwrap_or("https://api.anthropic.com/v1"),
+                "openrouter" | _ => provider_config.base_url.as_deref()
+                    .unwrap_or("https://openrouter.ai/api/v1"),
+            };
+            crate::providers::openrouter::OpenRouterProvider::new(
+                &provider_config.api_key,
+                &provider_config.model,
+                Some(base_url),
+                Some(agent_name),
+            )
+        };
 
         let souls_dir = config.souls_dir();
         let (agent_identity, soul) = identity::load_identity(&souls_dir, agent_name)?;

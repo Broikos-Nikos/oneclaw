@@ -4,6 +4,7 @@
 //! OneClaw — Multi-agent AI assistant with router architecture.
 
 pub mod agent;
+pub mod channels;
 pub mod config;
 pub mod identity;
 pub mod memory;

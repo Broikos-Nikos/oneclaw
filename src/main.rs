@@ -10,6 +10,7 @@
 //! routing/transfer capabilities.
 
 mod agent;
+mod channels;
 mod config;
 mod identity;
 mod memory;
@@ -18,6 +19,7 @@ mod router;
 mod tools;
 
 use crate::agent::Agent;
+use crate::channels::SendMessage;
 use crate::config::Config;
 use crate::router::Orchestrator;
 use anyhow::Result;
@@ -170,6 +172,19 @@ async fn cmd_agent(message: Option<String>, force_agent: Option<String>) -> Resu
 
     let _orchestrator = Orchestrator::new(config.clone());
 
+    // Start communication channels (if configured)
+    let (mut channel_rx, active_channels) = channels::start_channels(&config).await?;
+    let has_channels = !active_channels.is_empty();
+    if has_channels {
+        let names: Vec<&str> = active_channels.iter().map(|c| c.name()).collect();
+        println!(
+            "{}",
+            console::style(format!("📡 Active channels: {}", names.join(", ")))
+                .green()
+                .bold()
+        );
+    }
+
     if let Some(msg) = message {
         // Single-shot mode
         let (agent_name, response) = if let Some(ref forced) = force_agent {
@@ -202,90 +217,154 @@ async fn cmd_agent(message: Option<String>, force_agent: Option<String>) -> Resu
         }
         println!("Commands: /clear, /status, /agent <name>, /agents, /quit\n");
 
-        let mut rl = rustyline::DefaultEditor::new()?;
+        // Spawn a task for CLI input so we can select! between CLI and channels
+        let (cli_tx, mut cli_rx) = tokio::sync::mpsc::channel::<String>(16);
+        let cli_handle = tokio::task::spawn_blocking(move || {
+            let mut rl = rustyline::DefaultEditor::new().expect("Failed to create readline");
+            loop {
+                let line = match rl.readline("oneclaw> ") {
+                    Ok(line) => line,
+                    Err(rustyline::error::ReadlineError::Interrupted
+                        | rustyline::error::ReadlineError::Eof) => break,
+                    Err(e) => {
+                        eprintln!("Error: {e}");
+                        break;
+                    }
+                };
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let _ = rl.add_history_entry(&trimmed);
+                if cli_tx.blocking_send(trimmed).is_err() {
+                    break;
+                }
+            }
+        });
+
         let mut force_name: Option<String> = force_agent;
 
         loop {
-            let prompt = if let Some(ref name) = force_name {
-                format!("oneclaw [{}]> ", name)
-            } else {
-                "oneclaw> ".to_string()
-            };
+            tokio::select! {
+                // CLI input
+                cli_msg = cli_rx.recv() => {
+                    let Some(trimmed) = cli_msg else { break };
 
-            let line = match rl.readline(&prompt) {
-                Ok(line) => line,
-                Err(rustyline::error::ReadlineError::Interrupted | rustyline::error::ReadlineError::Eof) => break,
-                Err(e) => {
-                    eprintln!("Error: {e}");
-                    break;
-                }
-            };
-
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            let _ = rl.add_history_entry(trimmed);
-
-            // Handle commands
-            if trimmed.starts_with('/') {
-                match trimmed {
-                    "/quit" | "/exit" | "/q" => break,
-                    "/clear" => {
-                        for agent in agents.values_mut() {
-                            agent.clear_history();
+                    // Handle commands
+                    if trimmed.starts_with('/') {
+                        match trimmed.as_str() {
+                            "/quit" | "/exit" | "/q" => break,
+                            "/clear" => {
+                                for agent in agents.values_mut() {
+                                    agent.clear_history();
+                                }
+                                println!("{}", console::style("History cleared.").dim());
+                                continue;
+                            }
+                            "/agents" | "/status" => {
+                                println!("\n{}", console::style("Agents:").bold());
+                                for name in &available_agents {
+                                    let marker = if force_name.as_ref() == Some(name) { " ← forced" } else { "" };
+                                    let main_tag = if name == "main" { " (router)" } else { "" };
+                                    println!("  • {name}{main_tag}{marker}");
+                                }
+                                println!("  Routing: {}", if force_name.is_some() { "bypassed" } else { "main agent decides" });
+                                if has_channels {
+                                    let names: Vec<&str> = active_channels.iter().map(|c| c.name()).collect();
+                                    println!("  Channels: {}", names.join(", "));
+                                }
+                                println!();
+                                continue;
+                            }
+                            _ if trimmed.starts_with("/agent ") => {
+                                let name = trimmed.strip_prefix("/agent ").unwrap().trim();
+                                if name == "auto" || name == "main" {
+                                    force_name = None;
+                                    println!("{}", console::style("Routing: main agent decides").dim());
+                                } else if agents.contains_key(name) {
+                                    force_name = Some(name.to_string());
+                                    println!("{}", console::style(format!("Forced agent: {name}")).dim());
+                                } else {
+                                    eprintln!("Unknown agent: {name}. Available: {}", available_agents.join(", "));
+                                }
+                                continue;
+                            }
+                            _ => {
+                                eprintln!("Unknown command: {trimmed}");
+                                continue;
+                            }
                         }
-                        println!("{}", console::style("History cleared.").dim());
-                        continue;
                     }
-                    "/agents" | "/status" => {
-                        println!("\n{}", console::style("Agents:").bold());
-                        for name in &available_agents {
-                            let marker = if force_name.as_ref() == Some(name) { " ← forced" } else { "" };
-                            let main_tag = if name == "main" { " (router)" } else { "" };
-                            println!("  • {name}{main_tag}{marker}");
+
+                    // Route the message
+                    let target = force_name.as_deref().unwrap_or("main");
+                    let agent = agents.get_mut(target)
+                        .ok_or_else(|| anyhow::anyhow!("Agent '{}' not found", target))?;
+
+                    match agent.turn(&trimmed).await {
+                        Ok(response) => {
+                            let label = console::style(format!("[{}]", target)).cyan().bold();
+                            println!("\n{label}\n{response}\n");
                         }
-                        println!("  Routing: {}", if force_name.is_some() { "bypassed" } else { "main agent decides" });
-                        println!();
-                        continue;
-                    }
-                    _ if trimmed.starts_with("/agent ") => {
-                        let name = trimmed.strip_prefix("/agent ").unwrap().trim();
-                        if name == "auto" || name == "main" {
-                            force_name = None;
-                            println!("{}", console::style("Routing: main agent decides").dim());
-                        } else if agents.contains_key(name) {
-                            force_name = Some(name.to_string());
-                            println!("{}", console::style(format!("Forced agent: {name}")).dim());
-                        } else {
-                            eprintln!("Unknown agent: {name}. Available: {}", available_agents.join(", "));
+                        Err(e) => {
+                            eprintln!("{} {e}", console::style("Error:").red().bold());
                         }
-                        continue;
-                    }
-                    _ => {
-                        eprintln!("Unknown command: {trimmed}");
-                        continue;
                     }
                 }
-            }
 
-            // Route the message
-            let target = force_name.as_deref().unwrap_or("main");
-            let agent = agents.get_mut(target)
-                .ok_or_else(|| anyhow::anyhow!("Agent '{}' not found", target))?;
+                // Channel messages (Telegram, etc.)
+                channel_msg = channel_rx.recv() => {
+                    let Some(msg) = channel_msg else { continue };
 
-            match agent.turn(trimmed).await {
-                Ok(response) => {
-                    let label = console::style(format!("[{}]", target)).cyan().bold();
-                    println!("\n{label}\n{response}\n");
-                }
-                Err(e) => {
-                    eprintln!("{} {e}", console::style("Error:").red().bold());
+                    tracing::info!(
+                        "[{}] message from {}: {}",
+                        msg.channel,
+                        msg.sender,
+                        if msg.content.len() > 80 { format!("{}...", &msg.content[..80]) } else { msg.content.clone() }
+                    );
+
+                    // Find the channel to reply through
+                    let reply_channel = active_channels
+                        .iter()
+                        .find(|c| c.name() == msg.channel);
+
+                    let Some(reply_channel) = reply_channel else {
+                        tracing::warn!("No channel found for '{}' to reply", msg.channel);
+                        continue;
+                    };
+
+                    // Start typing indicator
+                    let _ = reply_channel.start_typing(&msg.reply_target).await;
+
+                    // Route through main agent
+                    let target = force_name.as_deref().unwrap_or("main");
+                    let agent = match agents.get_mut(target) {
+                        Some(a) => a,
+                        None => {
+                            tracing::error!("Agent '{}' not found for channel message", target);
+                            let _ = reply_channel.stop_typing(&msg.reply_target).await;
+                            continue;
+                        }
+                    };
+
+                    let response = match agent.turn(&msg.content).await {
+                        Ok(resp) => resp,
+                        Err(e) => {
+                            tracing::error!("Agent error processing channel message: {e}");
+                            format!("❌ Error: {e}")
+                        }
+                    };
+
+                    // Stop typing and send reply
+                    let _ = reply_channel.stop_typing(&msg.reply_target).await;
+                    if let Err(e) = reply_channel.send(&SendMessage::new(&response, &msg.reply_target)).await {
+                        tracing::error!("Failed to send reply via {}: {e}", msg.channel);
+                    }
                 }
             }
         }
 
+        cli_handle.abort();
         println!("\n{}", console::style("Goodbye! 🦀").dim());
     }
 
@@ -327,6 +406,7 @@ fn cmd_onboard(defaults: bool) -> Result<()> {
             providers,
             workspace: config::WorkspaceConfig::default(),
             agents: config::AgentsConfig::default(),
+            channels: config::ChannelsConfig::default(),
         }
     };
 

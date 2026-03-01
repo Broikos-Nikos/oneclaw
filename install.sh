@@ -4,7 +4,7 @@ set -euo pipefail
 # OneClaw Installer
 # Usage: curl -sSL https://raw.githubusercontent.com/YOUR_USERNAME/oneclaw/main/install.sh | bash
 
-REPO="YOUR_USERNAME/oneclaw"
+REPO="Broikos-Nikos/oneclaw"
 BRANCH="main"
 
 echo ""

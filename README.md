@@ -31,13 +31,13 @@ A task like "Design and build a landing page" flows:
 ## Install
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/YOUR_USERNAME/oneclaw/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/Broikos-Nikos/oneclaw/main/install.sh | bash
 ```
 
 Or build from source:
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/oneclaw.git
+git clone https://github.com/Broikos-Nikos/oneclaw.git
 cd oneclaw
 cargo build --release
 cp target/release/oneclaw ~/.cargo/bin/
@@ -116,6 +116,35 @@ souls_dir = "~/.oneclaw/agents"
 
 Sub-agents without a `[providers.<name>]` section fall back to the main agent's provider.
 
+### Provider Kinds
+
+| Kind | Base URL | Notes |
+|------|----------|-------|
+| `openrouter` | `openrouter.ai/api/v1` | Access 100+ models via one key |
+| `openai` | `api.openai.com/v1` | Direct OpenAI (GPT-4, etc.) |
+| `anthropic` | `api.anthropic.com/v1` | Direct Anthropic (Claude, etc.) |
+
+## Channels
+
+OneClaw supports messaging platform channels alongside the CLI:
+
+```toml
+# Telegram — simple, works behind NAT
+[channels.telegram]
+bot_token = "123456:ABCdef-YOUR_TOKEN"  # from @BotFather
+allowed_users = ["*"]                   # or ["your_username"]
+
+# WhatsApp — requires Meta Business account + public HTTPS endpoint
+[channels.whatsapp]
+access_token = "YOUR_META_ACCESS_TOKEN"
+phone_number_id = "YOUR_PHONE_NUMBER_ID"
+verify_token = "oneclaw-verify"
+allowed_numbers = ["*"]
+webhook_port = 8443
+```
+
+Run `oneclaw agent` — channels start alongside the CLI via `tokio::select!`.
+
 ## Agent Souls
 
 Each agent has a soul folder at `~/.oneclaw/agents/<name>/`:
@@ -157,11 +186,11 @@ Edit these files to customize agent behavior. The `identity.json` format:
 | **Agent config** | One identity | Per-agent soul folders |
 | **Routing** | Manual | Main agent decides |
 | **Sub-agents** | Not supported | User-created, any name |
-| **Channels** | 25+ (Telegram, Discord, etc.) | CLI only |
+| **Channels** | 25+ (Telegram, Discord, etc.) | Telegram + WhatsApp |
 | **Hardware** | GPIO, STM32, USB | Removed |
 | **WASM plugins** | Supported | Removed |
 | **Dependencies** | ~60 crates | ~20 crates |
-| **Platform integrations** | WhatsApp, Matrix, Lark, etc. | None (lean) |
+| **Providers** | OpenRouter only | OpenRouter, OpenAI, Anthropic |
 
 ## License
 
