@@ -244,7 +244,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Agent { message, agent, memory } => cmd_agent(message, agent, memory).await,
-        Commands::Onboard { defaults } => cmd_onboard(defaults),
+        Commands::Onboard { defaults } => cmd_onboard(defaults).await,
         Commands::Daemon => cmd_daemon().await,
         Commands::Doctor => cmd_doctor().await,
         Commands::Update { check, force } => cmd_update(check, force).await,
@@ -262,72 +262,26 @@ async fn main() -> Result<()> {
 
 // ─── Agent ────────────────────────────────────────────────────────────────────
 
-/// Run a message through the main agent with full delegation.
+/// Run a message through the main agent.
 ///
-/// When the main agent issues `transfer_to_agent`, this function:
-/// 1. Builds the requested sub-agent and runs it on the task.
-/// 2. Feeds the sub-agent's result back to the main agent via `continue_with_result`.
-/// 3. Loops until the main agent produces a final text response.
-///
-/// The main agent preserves conversation history across calls so the user
-/// gets a continuous interactive session.
-async fn run_with_delegation(main_agent: &mut Agent, input: &str, config: &Config) -> Result<String> {
-    let workspace_dir = config.workspace_dir();
-    let souls_dir = config.souls_dir();
-    let available_agents = identity::discover_agents(&souls_dir);
-
-    let mut current_result = main_agent.turn(input).await?;
-
-    loop {
-        match current_result {
-            TurnResult::Response(text) => return Ok(text),
-            TurnResult::Transfer { target_agent, task } => {
-                println!(
-                    "{}",
-                    console::style(format!("  → [{target_agent}] working on task...")).dim()
-                );
-
-                // Build and run the sub-agent on the delegated task.
-                let sub_tools = tools::core_tools(&workspace_dir);
-                let sub_result = match Agent::from_config(
-                    config,
-                    &target_agent,
-                    false,
-                    sub_tools,
-                    &available_agents,
-                ) {
-                    Ok(mut sub_agent) => {
-                        match sub_agent.turn(&task).await {
-                            Ok(TurnResult::Response(r)) => {
-                                println!(
-                                    "{}",
-                                    console::style(format!("  ✓ [{target_agent}] completed")).dim()
-                                );
-                                r
-                            }
-                            Ok(TurnResult::Transfer { target_agent: t2, task: t2_task }) => {
-                                // Sub-agents should not re-delegate; handle gracefully.
-                                format!(
-                                    "[{target_agent} tried to re-delegate to {t2}: {t2_task}]"
-                                )
-                            }
-                            Err(e) => format!("[{target_agent} error: {e}]"),
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "  ✗ Cannot build agent '{}': {}",
-                            target_agent, e
-                        );
-                        format!("[Failed to create agent '{target_agent}': {e}]")
-                    }
-                };
-
-                // Feed result back to the main agent and continue the loop.
-                current_result = main_agent
-                    .continue_with_result(&target_agent, &sub_result)
-                    .await?;
-            }
+/// With the AgentTool pattern, delegation to sub-agents is handled
+/// synchronously inside each `delegate_to_X` tool — the sub-agent runs,
+/// returns its result as a tool result, and the main agent continues
+/// reasoning before producing a final response. This function is now a
+/// thin wrapper around `agent.turn()`.
+async fn run_with_delegation(main_agent: &mut Agent, input: &str, _config: &Config) -> Result<String> {
+    match main_agent.turn(input).await? {
+        TurnResult::Response(text) => Ok(text),
+        TurnResult::Transfer { target_agent, task } => {
+            // Fallback: should not be generated with AgentDelegateTool.
+            tracing::warn!(
+                "Unexpected Transfer to '{}' — delegation is now inline via tool call",
+                target_agent
+            );
+            Ok(format!(
+                "[Agent requested transfer to '{target_agent}' for task '{task}', \
+                 but inline delegation is active. Please retry.]"
+            ))
         }
     }
 }
@@ -529,43 +483,13 @@ async fn cmd_agent(
                                     ).await;
                                 }
                             }
-                            TurnResult::Transfer { target_agent, task } => {
-                                let existing = task_manager
-                                    .find_for_agent(&target_agent)
-                                    .map(|id| id.to_string());
-                                if let Some(existing_id) = existing {
-                                    // Same agent already running — queue the follow-up.
-                                    task_manager.enqueue(&existing_id, &task);
-                                    println!(
-                                        "\n{} Follow-up queued for [{}] — runs after current task\n",
-                                        console::style("\u{21a9}").yellow().bold(),
-                                        console::style(&target_agent).bold(),
-                                    );
-                                } else {
-                                    // Spawn a new parallel agent.
-                                    let task_id = task_manager.register(&target_agent, &task);
-                                    let cfg = config.clone();
-                                    let tx  = result_tx.clone();
-                                    let ta  = target_agent.clone();
-                                    let t   = task.clone();
-                                    tokio::spawn(async move {
-                                        let output =
-                                            agent::run_agent_task(&cfg, &ta, &t, false, 0)
-                                                .await
-                                                .unwrap_or_else(|e| format!("[{ta} error: {e}]"));
-                                        let _ = tx.send(agent::task_manager::TaskResult {
-                                            task_id,
-                                            agent_name: ta,
-                                            description: t,
-                                            output,
-                                        }).await;
-                                    });
-                                    println!(
-                                        "\n{} [{}] agent spawned — running in background\n",
-                                        console::style("\u{26a1}").cyan().bold(),
-                                        console::style(&target_agent).bold(),
-                                    );
-                                }
+                            // Fallback: Transfer should not occur with AgentDelegateTool,
+                            // but if it does (e.g. sub-agent called directly), warn.
+                            TurnResult::Transfer { target_agent, .. } => {
+                                tracing::warn!(
+                                    "Unexpected Transfer to '{}' in interactive loop — delegation is now inline",
+                                    target_agent
+                                );
                             }
                         }
                     }
@@ -577,31 +501,11 @@ async fn cmd_agent(
                             TurnResult::Response(text) => {
                                 println!("{}: {text}\n", console::style(&prefix).dim());
                             }
-                            TurnResult::Transfer { target_agent, task } => {
-                                let existing = task_manager
-                                    .find_for_agent(&target_agent)
-                                    .map(|id| id.to_string());
-                                if let Some(existing_id) = existing {
-                                    task_manager.enqueue(&existing_id, &task);
-                                } else {
-                                    let task_id = task_manager.register(&target_agent, &task);
-                                    let cfg = config.clone();
-                                    let tx  = result_tx.clone();
-                                    let ta  = target_agent.clone();
-                                    let t   = task.clone();
-                                    tokio::spawn(async move {
-                                        let output =
-                                            agent::run_agent_task(&cfg, &ta, &t, false, 0)
-                                                .await
-                                                .unwrap_or_else(|e| format!("[{ta} error: {e}]"));
-                                        let _ = tx.send(agent::task_manager::TaskResult {
-                                            task_id,
-                                            agent_name: ta,
-                                            description: t,
-                                            output,
-                                        }).await;
-                                    });
-                                }
+                            TurnResult::Transfer { target_agent, .. } => {
+                                tracing::warn!(
+                                    "Unexpected Transfer to '{}' from channel message — delegation is now inline",
+                                    target_agent
+                                );
                             }
                         }
                     }
@@ -614,7 +518,7 @@ async fn cmd_agent(
 
 // ─── Onboard ──────────────────────────────────────────────────────────────────
 
-fn cmd_onboard(use_defaults: bool) -> Result<()> {
+async fn cmd_onboard(use_defaults: bool) -> Result<()> {
     println!("{}", console::style("OneClaw Setup").bold().cyan());
     println!();
 
@@ -901,6 +805,103 @@ fn cmd_onboard(use_defaults: bool) -> Result<()> {
     // Init data dir
     std::fs::create_dir_all(&Config::data_dir())?;
 
+    // ── WhatsApp Web QR pairing (inline during onboard) ──────────────────
+    let wa_paired = if let Some(ref wa) = config.channels.whatsapp {
+        if let Some(ref session_path) = wa.session_path {
+            #[cfg(feature = "whatsapp-web")]
+            {
+                println!();
+                println!("{}", console::style("WhatsApp Web Pairing").bold().cyan());
+                println!("  Open WhatsApp on your phone → Settings → Linked Devices → Link a Device");
+                println!();
+
+                match channels::whatsapp_web::WhatsAppWebChannel::pair(
+                    session_path,
+                    wa.pair_phone.as_deref(),
+                    wa.pair_code.as_deref(),
+                )
+                .await
+                {
+                    Ok(()) => {
+                        println!();
+                        println!("  {}", console::style("✅ WhatsApp linked successfully!").bold().green());
+                        println!();
+                        true
+                    }
+                    Err(e) => {
+                        println!();
+                        println!("  {} WhatsApp pairing failed: {e}", console::style("⚠").yellow());
+                        println!("  You can retry by running: oneclaw daemon");
+                        println!("  The QR code will appear again on first launch.");
+                        println!();
+                        false
+                    }
+                }
+            }
+            #[cfg(not(feature = "whatsapp-web"))]
+            {
+                let _ = session_path;
+                println!();
+                println!("  {} WhatsApp Web QR pairing requires --features whatsapp-web", console::style("⚠").yellow());
+                println!("  Rebuild with: cargo build --release --features whatsapp-web");
+                println!("  Then re-run: oneclaw onboard");
+                println!();
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
+    // ── Install as OS service (auto-start on reboot) ─────────────────────
+    let has_channel = config.channels.telegram.is_some() || config.channels.whatsapp.is_some();
+    if has_channel {
+        println!();
+        let install_service = dialoguer::Confirm::new()
+            .with_prompt("Install OneClaw as a system service? (auto-starts on reboot)")
+            .default(true)
+            .interact()?;
+
+        if install_service {
+            let bin_path = std::env::current_exe().unwrap_or_else(|_| {
+                std::path::PathBuf::from(
+                    shellexpand::tilde("~/.cargo/bin/oneclaw").into_owned()
+                )
+            });
+            match service::manage(ServiceAction::Install, &bin_path) {
+                Ok(()) => {}
+                Err(e) => {
+                    println!("  {} Service install failed: {e}", console::style("⚠").yellow());
+                    println!("  You can install later with: oneclaw service install");
+                }
+            }
+        }
+    }
+
+    // ── Start daemon immediately ─────────────────────────────────────────
+    if has_channel {
+        let start_now = dialoguer::Confirm::new()
+            .with_prompt("Start OneClaw daemon now?")
+            .default(wa_paired)
+            .interact()?;
+
+        if start_now {
+            println!();
+            println!("{}", console::style("Starting OneClaw daemon...").bold().green());
+            println!("  Messages from your channels will be processed by the main agent.");
+            println!("  Press Ctrl+C to stop.");
+            println!();
+
+            let config = Arc::new(Config::load()?);
+            let daemon_cfg = daemon::DaemonConfig {
+                heartbeat_interval_secs: config.daemon.heartbeat_interval_secs,
+            };
+            return daemon::run(config, daemon_cfg).await;
+        }
+    }
+
     println!();
     println!("{}", console::style("Setup complete!").bold().green());
     println!();
@@ -918,8 +919,12 @@ fn cmd_onboard(use_defaults: bool) -> Result<()> {
     if config.channels.whatsapp.is_some() {
         let wa = config.channels.whatsapp.as_ref().unwrap();
         if wa.session_path.is_some() {
-            println!("  → WhatsApp Web: run 'oneclaw daemon' and scan the QR code shown in the terminal.");
-            println!("    Open WhatsApp > Linked Devices > Link a Device.");
+            if wa_paired {
+                println!("  → WhatsApp Web: already linked! Run 'oneclaw daemon' to start.");
+            } else {
+                println!("  → WhatsApp Web: run 'oneclaw daemon' and scan the QR code shown in the terminal.");
+                println!("    Open WhatsApp > Linked Devices > Link a Device.");
+            }
         } else {
             println!("  → WhatsApp Cloud API: point your Meta webhook to http://<your-ip>:8443/webhook");
             println!("    Use ngrok or Cloudflare Tunnel to expose the port publicly.");

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # OneClaw Installer
-# Usage: curl -sSL https://raw.githubusercontent.com/Broikos-Nikos/oneclaw/main/install.sh | bash
+# Usage: sudo curl -sSL https://raw.githubusercontent.com/Broikos-Nikos/oneclaw/main/install.sh | bash
 
 REPO="Broikos-Nikos/oneclaw"
 BRANCH="main"
@@ -65,7 +65,7 @@ fi
 
 # ─── Clone and build ─────────────────────────────────────────────────────
 
-INSTALL_DIR="$HOME/.oneclaw/src"
+INSTALL_DIR="$HOME/.oneclaw/repo"
 
 if [ -d "$INSTALL_DIR" ]; then
   echo "📦 Updating existing source..."
@@ -77,8 +77,8 @@ else
   cd "$INSTALL_DIR"
 fi
 
-echo "🔨 Building OneClaw (release mode)..."
-cargo build --release
+echo "🔨 Building OneClaw (release mode with WhatsApp Web support)..."
+cargo build --release --features whatsapp-web
 
 # ─── Install binary ──────────────────────────────────────────────────────
 
@@ -104,11 +104,25 @@ fi
 
 # ─── Initial setup ───────────────────────────────────────────────────────
 
+# Refresh shell hash so the new binary is found immediately
+hash -r 2>/dev/null || true
+
 echo ""
 echo "✅ OneClaw installed to: $CARGO_BIN/oneclaw"
 echo ""
 
-# Run onboard with defaults if no config exists
+# Verify the binary is reachable
+if ! have_cmd oneclaw; then
+  echo "⚠  'oneclaw' not found in PATH. Run the following, then try again:"
+  echo ""
+  echo "    export PATH=\"\$HOME/.cargo/bin:\$PATH\""
+  echo ""
+  echo "  Or start a new terminal session."
+  echo ""
+  exit 0
+fi
+
+# Run onboard if no config exists
 ONECLAW_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/oneclaw"
 if [ ! -f "$ONECLAW_CONFIG_DIR/config.toml" ]; then
   echo "🔧 Running initial setup..."

@@ -275,6 +275,129 @@ impl WhatsAppWebChannel {
         }
     }
 
+    /// Run the WhatsApp Web pairing flow during onboarding.
+    ///
+    /// Builds a Bot, displays the QR code in the terminal, and blocks until
+    /// `Event::Connected` fires (i.e. the user scanned the QR in WhatsApp).
+    /// After successful pairing the session keys are persisted in the SQLite DB
+    /// so future starts skip the QR step.
+    ///
+    /// Returns `Ok(())` once pairing succeeds, or an error if the connection
+    /// drops before pairing completes.
+    #[cfg(feature = "whatsapp-web")]
+    pub async fn pair(
+        session_path: &str,
+        pair_phone: Option<&str>,
+        pair_code: Option<&str>,
+    ) -> Result<()> {
+        use wa_rs::bot::Bot;
+        use wa_rs::pair_code::PairCodeOptions;
+        use wa_rs::store::{Device, DeviceStore};
+        use wa_rs_core::types::events::Event;
+        use wa_rs_tokio_transport::TokioWebSocketTransportFactory;
+        use wa_rs_ureq_http::UreqHttpClient;
+
+        let session_path_expanded = shellexpand::tilde(session_path).into_owned();
+
+        // Ensure parent directory exists
+        if let Some(parent) = std::path::Path::new(&session_path_expanded).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let storage = RusqliteStore::new(&session_path_expanded)?;
+        let backend = Arc::new(storage);
+
+        // If a session already exists and loads successfully, skip pairing.
+        if backend.exists().await? {
+            if backend.load().await?.is_some() {
+                eprintln!("  ✅ WhatsApp Web session already paired — skipping QR.");
+                return Ok(());
+            }
+        }
+
+        // Oneshot channel to know when Event::Connected fires.
+        let (connected_tx, connected_rx) = tokio::sync::oneshot::channel::<()>();
+        let connected_tx = Arc::new(parking_lot::Mutex::new(Some(connected_tx)));
+
+        let _device = Device::new(backend.clone());
+        let transport_factory = TokioWebSocketTransportFactory::new();
+        let http_client = UreqHttpClient::new();
+
+        let connected_tx_clone = connected_tx.clone();
+        let mut builder = Bot::builder()
+            .with_backend(backend)
+            .with_transport_factory(transport_factory)
+            .with_http_client(http_client)
+            .on_event(move |event, _client| {
+                let connected_tx = connected_tx_clone.clone();
+                async move {
+                    match event {
+                        Event::Connected(_) => {
+                            if let Some(tx) = connected_tx.lock().take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                        Event::PairingQrCode { code, .. } => {
+                            match Self::render_pairing_qr(&code) {
+                                Ok(rendered) => {
+                                    eprintln!();
+                                    eprintln!(
+                                        "  Scan this QR code in WhatsApp → Linked Devices:"
+                                    );
+                                    eprintln!("{rendered}");
+                                    eprintln!(
+                                        "  Waiting for scan..."
+                                    );
+                                }
+                                Err(err) => {
+                                    eprintln!("  ⚠ Failed to render QR: {err}");
+                                    eprintln!("  QR payload: {code}");
+                                }
+                            }
+                        }
+                        Event::PairingCode { code, .. } => {
+                            eprintln!("  Pair code: {code}");
+                            eprintln!(
+                                "  Enter this code in WhatsApp → Linked Devices"
+                            );
+                        }
+                        Event::LoggedOut(_) => {
+                            tracing::warn!("WhatsApp Web pairing: logged out");
+                        }
+                        Event::StreamError(e) => {
+                            tracing::error!("WhatsApp Web pairing stream error: {:?}", e);
+                        }
+                        _ => {}
+                    }
+                }
+            });
+
+        // Configure pair-code flow when a phone number is provided.
+        if let Some(phone) = pair_phone {
+            builder = builder.with_pair_code(PairCodeOptions {
+                phone_number: phone.to_string(),
+                custom_code: pair_code.map(String::from),
+                ..Default::default()
+            });
+        }
+
+        let mut bot = builder.build().await?;
+        let bot_handle = bot.run().await?;
+
+        // Block until Event::Connected fires.
+        connected_rx
+            .await
+            .map_err(|_| anyhow!("WhatsApp pairing failed — connection was dropped before pairing completed"))?;
+
+        // Give the session a moment to flush keys to the DB.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        // Shut down the pairing bot — the daemon will start a fresh one.
+        bot_handle.abort();
+
+        Ok(())
+    }
+
     /// Whether the recipient string is a WhatsApp JID (contains a domain suffix).
     #[cfg(feature = "whatsapp-web")]
     fn is_jid(recipient: &str) -> bool {
@@ -678,7 +801,6 @@ impl Channel for WhatsAppWebChannel {
                                         reply_target: chat,
                                         content,
                                         timestamp: chrono::Utc::now().timestamp() as u64,
-                                        thread_ts: None,
                                     })
                                     .await
                                 {
@@ -851,6 +973,17 @@ impl WhatsAppWebChannel {
         _allowed_numbers: Vec<String>,
     ) -> Self {
         Self { _private: () }
+    }
+
+    pub async fn pair(
+        _session_path: &str,
+        _pair_phone: Option<&str>,
+        _pair_code: Option<&str>,
+    ) -> anyhow::Result<()> {
+        anyhow::bail!(
+            "WhatsApp Web pairing requires the 'whatsapp-web' feature. \
+             Rebuild with: cargo build --features whatsapp-web"
+        );
     }
 }
 

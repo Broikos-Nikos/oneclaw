@@ -1,6 +1,11 @@
 // Agent module — core agent struct, prompt builder, and conversation loop.
-// All agents have the same structure. The main agent additionally gets a
-// routing prompt and a transfer_to_agent tool.
+// All agents have the same structure. The main agent additionally gets
+// per-agent delegate tools — one named tool per sub-agent, following the
+// "AgentTool" philosophy from Google ADK / Antigravity:
+//   • Each sub-agent appears as its own named tool (e.g. delegate_to_developer)
+//   • The tool description is loaded from the sub-agent's soul (role + strengths)
+//   • The main LLM semantically matches the task to the right tool by description
+//   • Delegation is synchronous — result flows back inline as a tool result
 
 pub mod dispatcher;
 pub mod prompt;
@@ -11,54 +16,40 @@ use crate::identity;
 use crate::providers::ConversationMessage;
 use crate::tools::Tool;
 use anyhow::Result;
+use std::sync::Arc;
 
-/// Run a message through any agent with full recursive delegation support.
+/// Run a message through any agent and return a text result.
 ///
-/// Creates a fresh agent instance for the given name, runs the task, and
-/// if the agent delegates to another agent (via `transfer_to_agent`), builds
-/// that sub-agent, runs it, feeds results back, and loops until done.
+/// Creates a fresh agent instance, runs the task through it, and returns
+/// the final response. With the AgentTool pattern, any sub-agent delegation
+/// is handled inline by `delegate_to_X` tool calls — this function just
+/// runs a single agent to completion.
 ///
-/// `depth` prevents infinite delegation loops (max 4 levels).
-/// Use `is_main = true` only for the "main" agent.
+/// `depth` is kept for call-site compatibility but no longer enforces recursion
+/// since delegation is now synchronous inside AgentDelegateTool.
+/// Use `is_main = true` only for the root orchestrator agent.
 pub async fn run_agent_task(
     config: &Config,
     agent_name: &str,
     task: &str,
     is_main: bool,
-    depth: u32,
+    _depth: u32,
 ) -> anyhow::Result<String> {
-    const MAX_DEPTH: u32 = 4;
-    if depth >= MAX_DEPTH {
-        tracing::warn!("Max delegation depth ({MAX_DEPTH}) reached at agent '{agent_name}'");
-        return Ok(format!("[Max delegation depth reached — unable to delegate further]"));
-    }
-
     let workspace_dir = config.workspace_dir();
     let souls_dir = config.souls_dir();
     let available = crate::identity::discover_agents(&souls_dir);
     let tools = crate::tools::core_tools(&workspace_dir);
 
     let mut agent = Agent::from_config(config, agent_name, is_main, tools, &available)?;
-    let mut current = agent.turn(task).await?;
-
-    loop {
-        match current {
-            TurnResult::Response(text) => return Ok(text),
-            TurnResult::Transfer { target_agent, task: subtask } => {
-                tracing::info!("[{agent_name}] delegating to [{target_agent}]: {subtask}");
-                // Recursively run the sub-agent (depth+1 prevents infinite loops)
-                let sub_result = Box::pin(run_agent_task(
-                    config,
-                    &target_agent,
-                    &subtask,
-                    false,
-                    depth + 1,
-                ))
-                .await
-                .unwrap_or_else(|e| format!("[{target_agent} error: {e}]"));
-                // Feed sub-agent result back so main agent can continue
-                current = agent.continue_with_result(&target_agent, &sub_result).await?;
-            }
+    match agent.turn(task).await? {
+        TurnResult::Response(text) => Ok(text),
+        TurnResult::Transfer { target_agent, .. } => {
+            // Should not happen — AgentDelegateTool handles delegation inline.
+            tracing::warn!(
+                "Unexpected Transfer to '{}' from agent '{}' — delegation is now inline",
+                target_agent, agent_name
+            );
+            Ok(format!("[Unexpected delegation to '{target_agent}' — result unavailable]"))
         }
     }
 }
@@ -164,18 +155,26 @@ impl Agent {
             &provider_config.model,
         );
 
-        // Main agent gets the routing section
+        // Main agent gets the routing section + one delegate tool per sub-agent.
+        // This follows the AgentTool pattern: each sub-agent is its own named
+        // tool with a description from its soul, so the LLM picks the right
+        // one by semantic match — no explicit agent name required.
         if is_main && available_agents.len() > 1 {
             system_prompt.push_str(&identity::routing_prompt(available_agents, &souls_dir));
 
-            // Add a transfer_to_agent tool to the tools list
-            tools.push(Box::new(TransferTool {
-                available_agents: available_agents
-                    .iter()
-                    .filter(|a| a.as_str() != "main")
-                    .cloned()
-                    .collect(),
-            }));
+            let config_arc = Arc::new(config.clone());
+            for sub_name in available_agents.iter().filter(|a| a.as_str() != "main") {
+                let description = identity::load_identity(&souls_dir, sub_name)
+                    .map(|f| build_delegate_description(sub_name, &f.identity))
+                    .unwrap_or_else(|_| format!("Delegate to the {} specialist agent.", sub_name));
+                let tool_name = format!("delegate_to_{}", sanitize_agent_name(sub_name));
+                tools.push(Box::new(AgentDelegateTool {
+                    agent_name: sub_name.clone(),
+                    tool_name,
+                    description,
+                    config: Arc::clone(&config_arc),
+                }));
+            }
         }
 
         Ok(Self {
@@ -264,21 +263,6 @@ impl Agent {
             for call in &tool_calls {
                 let result = dispatcher::execute_tool_call(call, &self.tools).await;
 
-                // Check for transfer_to_agent marker
-                if result.success && result.output.starts_with("[TRANSFER_PENDING:") {
-                    if let Some(transfer) = parse_transfer_marker(&result.output) {
-                        // Save the assistant message that requested the transfer
-                        self.history.push(ConversationMessage {
-                            role: "assistant".into(),
-                            content: content.clone(),
-                        });
-                        return Ok(TurnResult::Transfer {
-                            target_agent: transfer.0,
-                            task: transfer.1,
-                        });
-                    }
-                }
-
                 tool_results.push_str(&format!(
                     "<tool_result name=\"{}\">\n{}\n</tool_result>\n\n",
                     call.name,
@@ -359,19 +343,6 @@ impl Agent {
             for call in &tool_calls {
                 let result = dispatcher::execute_tool_call(call, &self.tools).await;
 
-                if result.success && result.output.starts_with("[TRANSFER_PENDING:") {
-                    if let Some(transfer) = parse_transfer_marker(&result.output) {
-                        self.history.push(ConversationMessage {
-                            role: "assistant".into(),
-                            content: content.clone(),
-                        });
-                        return Ok(TurnResult::Transfer {
-                            target_agent: transfer.0,
-                            task: transfer.1,
-                        });
-                    }
-                }
-
                 tool_results.push_str(&format!(
                     "<tool_result name=\"{}\">\n{}\n</tool_result>\n\n",
                     call.name,
@@ -408,114 +379,114 @@ impl Agent {
     }
 }
 
-// ─── Transfer Tool ──────────────────────────────────────────────────────────
+// ─── Agent Delegate Tools (AgentTool philosophy) ────────────────────────────
+//
+// Instead of one generic `transfer_to_agent(agent, task)` tool, each sub-agent
+// is exposed as its own named tool: `delegate_to_developer`, `delegate_to_creative`,
+// etc. The description comes from the agent's soul (role + strengths), so the
+// LLM semantically picks the right agent without needing to know its name.
+//
+// This follows the Google ADK `AgentTool` / Antigravity "Skills" pattern:
+// sub-agents are treated as first-class tools, run synchronously, and return
+// results inline — the main agent continues reasoning with the result.
 
-/// A tool that allows the main agent to transfer work to a sub-agent.
-/// The actual execution happens in main.rs where we have access to all agents.
-/// Here, the tool just validates the request and returns a marker for main.rs to handle.
-struct TransferTool {
-    available_agents: Vec<String>,
+struct AgentDelegateTool {
+    agent_name: String,
+    tool_name: String,
+    description: String,
+    config: Arc<Config>,
 }
 
 #[async_trait::async_trait]
-impl Tool for TransferTool {
+impl Tool for AgentDelegateTool {
     fn name(&self) -> &str {
-        "transfer_to_agent"
+        &self.tool_name
     }
 
     fn description(&self) -> &str {
-        "Transfer a task to another agent. The agent will work on the task in the shared workspace and return results. Use this when a task matches another agent's specialization."
+        &self.description
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
             "properties": {
-                "agent": {
-                    "type": "string",
-                    "description": format!("Name of the agent to transfer to. Available: {}", self.available_agents.join(", "))
-                },
                 "task": {
                     "type": "string",
-                    "description": "Description of the task to delegate. Be specific and include all necessary context."
+                    "description": "The specific task to give this agent. Be concrete — include all relevant context, file names, goals, and constraints."
                 }
             },
-            "required": ["agent", "task"]
+            "required": ["task"]
         })
     }
 
     async fn execute(&self, args: serde_json::Value) -> Result<crate::tools::ToolResult> {
-        let agent_name = args["agent"].as_str().unwrap_or_default();
         let task = args["task"].as_str().unwrap_or_default();
-
-        if !self.available_agents.iter().any(|a| a == agent_name) {
-            return Ok(crate::tools::ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Unknown agent '{}'. Available: {}",
-                    agent_name,
-                    self.available_agents.join(", ")
-                )),
-            });
-        }
-
         if task.is_empty() {
             return Ok(crate::tools::ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("Task description is required".into()),
+                error: Some("task is required".into()),
             });
         }
 
-        // Return a marker — the actual delegation is handled by the caller
-        // who has access to all agent instances.
+        tracing::info!("[main] → delegating to [{}]: {}", self.agent_name, task);
+
+        // Run the sub-agent synchronously — result flows back as a tool result.
+        // This is the AgentTool pattern: the main agent gets the answer inline
+        // and can reason over it before responding to the user.
+        let result = Box::pin(run_agent_task(
+            &self.config,
+            &self.agent_name,
+            task,
+            false,
+            0,
+        ))
+        .await
+        .unwrap_or_else(|e| format!("[{} error: {}]", self.agent_name, e));
+
         Ok(crate::tools::ToolResult {
             success: true,
-            output: format!("[TRANSFER_PENDING:{}] {}", agent_name, task),
+            output: result,
             error: None,
         })
     }
 }
 
-/// Parse a `[TRANSFER_PENDING:agent_name] task description` marker.
-/// Returns (agent_name, task) if the marker is valid.
-fn parse_transfer_marker(output: &str) -> Option<(String, String)> {
-    let rest = output.strip_prefix("[TRANSFER_PENDING:")?;
-    let end_bracket = rest.find(']')?;
-    let agent_name = rest[..end_bracket].trim().to_string();
-    let task = rest[end_bracket + 1..].trim().to_string();
-    if agent_name.is_empty() || task.is_empty() {
-        return None;
+/// Build the tool description for a sub-agent delegate tool.
+/// Derived from the agent's identity — role, strengths, and personality.
+fn build_delegate_description(agent_name: &str, identity: &crate::identity::AgentIdentity) -> String {
+    // Use the agent's configured display name, or capitalise the folder name.
+    let display_name = if !identity.name.is_empty() {
+        identity.name.clone()
+    } else {
+        let mut c = agent_name.chars();
+        match c.next() {
+            None => agent_name.to_string(),
+            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        }
+    };
+
+    let mut desc = if !identity.role.is_empty() {
+        format!("{} ({}). ", display_name, identity.role)
+    } else {
+        format!("{} agent. ", display_name)
+    };
+    if !identity.strengths.is_empty() {
+        desc.push_str(&format!("Strengths: {}. ", identity.strengths.join(", ")));
     }
-    Some((agent_name, task))
+    desc.push_str(&format!(
+        "Use this tool when the task matches {}'s specialization — the result \
+         is returned directly to you so you can synthesize and respond.",
+        agent_name
+    ));
+    desc
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_transfer_marker_valid() {
-        let output = "[TRANSFER_PENDING:developer] Write the homepage HTML";
-        let result = parse_transfer_marker(output);
-        assert_eq!(
-            result,
-            Some(("developer".to_string(), "Write the homepage HTML".to_string()))
-        );
-    }
-
-    #[test]
-    fn parse_transfer_marker_empty_task() {
-        let output = "[TRANSFER_PENDING:developer] ";
-        let result = parse_transfer_marker(output);
-        assert_eq!(result, None);
-    }
-
-    #[test]
-    fn parse_transfer_marker_invalid() {
-        let output = "Some random tool output";
-        let result = parse_transfer_marker(output);
-        assert_eq!(result, None);
-    }
+/// Sanitize an agent name for use in a tool name (only alphanumeric and underscores).
+fn sanitize_agent_name(name: &str) -> String {
+    name.chars()
+        .map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' })
+        .collect()
 }
+

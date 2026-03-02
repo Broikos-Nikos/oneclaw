@@ -150,20 +150,23 @@ pub fn identity_to_prompt(identity: &AgentIdentity, soul: &str) -> String {
 }
 
 /// Build the extra routing prompt section for the main agent.
-/// Lists available sub-agents so the main agent knows who it can delegate to.
+/// Explains the per-agent delegate tools that the LLM can call.
 pub fn routing_prompt(available_agents: &[String], souls_dir: &Path) -> String {
     let mut prompt = String::new();
-    prompt.push_str("## Agent Routing\n\n");
-    prompt.push_str("You are the **main router agent**. You can delegate tasks to other agents.\n\n");
-    prompt.push_str("To delegate, use the `transfer_to_agent` tool with the agent name and task description.\n");
-    prompt.push_str("The other agent will work in the same shared workspace and return results to you.\n\n");
-    prompt.push_str("**Available agents:**\n\n");
+    prompt.push_str("## Agent Delegation (AgentTool pattern)\n\n");
+    prompt.push_str(
+        "You are the **main orchestrator**. You have access to specialist agents as tools.\n\
+         Each specialist tool runs the agent synchronously and returns its result to you.\n\
+         You then reason over the result and produce your final response to the user.\n\n"
+    );
+    prompt.push_str("**Available specialist tools:**\n\n");
 
     for agent_name in available_agents {
         if agent_name == "main" {
             continue; // Don't list self
         }
-        // Try to load a summary of the agent
+        let tool_name = format!("delegate_to_{}",
+            agent_name.chars().map(|c| if c.is_alphanumeric() || c == '_' { c } else { '_' }).collect::<String>());
         let summary = load_identity(souls_dir, agent_name)
             .map(|files| {
                 if !files.identity.role.is_empty() {
@@ -174,14 +177,15 @@ pub fn routing_prompt(available_agents: &[String], souls_dir: &Path) -> String {
             })
             .unwrap_or_else(|_| agent_name.clone());
 
-        prompt.push_str(&format!("- **{agent_name}**: {summary}\n"));
+        prompt.push_str(&format!("- `{tool_name}(task)`: {summary}\n"));
     }
 
-    prompt.push_str("\n**Routing rules:**\n");
-    prompt.push_str("- Analyze the task and pick the most appropriate agent.\n");
-    prompt.push_str("- For multi-step tasks, break them down and transfer each step separately.\n");
-    prompt.push_str("- If no sub-agent fits, handle the task yourself.\n");
-    prompt.push_str("- After receiving results from a sub-agent, synthesize and respond to the user.\n\n");
+    prompt.push_str("\n**Delegation rules:**\n");
+    prompt.push_str("- Read each specialist tool's description and pick the one whose expertise matches the task.\n");
+    prompt.push_str("- The tool runs the specialist and returns its complete output to you — you do not need to monitor it.\n");
+    prompt.push_str("- After receiving a specialist result, synthesize it and respond to the user.\n");
+    prompt.push_str("- For multi-step tasks, call specialists one at a time, using each result to inform the next step.\n");
+    prompt.push_str("- If no specialist fits the task, handle it yourself.\n\n");
 
     prompt
 }
