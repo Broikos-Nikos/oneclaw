@@ -391,36 +391,123 @@ async fn cmd_agent(
             }
         }
         None => {
-            // Interactive mode
+            // ── Parallel interactive mode ──────────────────────────────────────
+            // Main agent stays responsive while sub-agents run concurrently.
+            // Transfers to the same already-running agent are queued (backlinked).
+            // Transfers to a different agent spawn a new parallel worker.
             println!(
                 "{}",
-                console::style(format!("OneClaw [{main_name}] — type 'exit' or press Ctrl+C to quit"))
-                    .dim()
+                console::style(format!(
+                    "OneClaw [{main_name}] — type 'exit' to quit, 'tasks' to see running agents"
+                ))
+                .dim()
             );
 
-            let mut rl = rustyline::DefaultEditor::new()?;
+            // Readline runs in its own OS thread so the async runtime stays free.
+            let (input_tx, mut input_rx) = tokio::sync::mpsc::channel::<Option<String>>(16);
+            {
+                let tx = input_tx;
+                std::thread::spawn(move || {
+                    let mut rl = rustyline::DefaultEditor::new().expect("readline init");
+                    loop {
+                        match rl.readline("\u{25b6} ") {
+                            Ok(line) => {
+                                let trimmed = line.trim().to_string();
+                                if !trimmed.is_empty() {
+                                    let _ = rl.add_history_entry(&trimmed);
+                                }
+                                if tx.blocking_send(Some(trimmed)).is_err() {
+                                    break;
+                                }
+                            }
+                            Err(_) => {
+                                let _ = tx.blocking_send(None);
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+
+            // Channel for completed background agent results.
+            let (result_tx, mut result_rx) =
+                tokio::sync::mpsc::channel::<agent::task_manager::TaskResult>(64);
+
+            let mut task_manager = agent::task_manager::TaskManager::new();
             let mut first_turn = true;
+            let main_name_owned = main_name.to_string();
 
             loop {
-                // Handle incoming channel messages
-                while let Ok(chan_msg) = chan_rx.try_recv() {
-                    let prefix = format!("[{}] {}: ", chan_msg.channel, chan_msg.sender);
-                    let response = run_with_delegation(&mut agent, &format!("{prefix}{}", chan_msg.content), &config).await?;
-                    println!("{}", console::style(&prefix).dim());
-                    println!("{response}");
-                }
+                tokio::select! {
+                    // ── Background agent finished ──────────────────────────────
+                    Some(result) = result_rx.recv() => {
+                        println!(
+                            "\n{} {} finished:\n{}\n",
+                            console::style("\u{2705}").green(),
+                            console::style(format!("[{}]", result.agent_name)).bold(),
+                            result.output,
+                        );
+                        // Let the main agent know what the sub-agent produced.
+                        agent.inject_result(&result.agent_name, &result.output);
 
-                let prompt = format!(
-                    "{} ",
-                    console::style("▶").cyan().bold()
-                );
-                let readline = rl.readline(&prompt);
-                match readline {
-                    Ok(line) => {
-                        let line = line.trim().to_string();
+                        // Spawn the next queued (backlinked) task if any.
+                        if let Some((next_agent, next_task)) = task_manager.finish(&result.task_id) {
+                            let new_id = task_manager.register(&next_agent, &next_task);
+                            println!(
+                                "{} Running queued task for [{}]...\n",
+                                console::style("\u{2192}").dim(),
+                                console::style(&next_agent).bold(),
+                            );
+                            let cfg = config.clone();
+                            let tx  = result_tx.clone();
+                            let na  = next_agent.clone();
+                            let nt  = next_task.clone();
+                            tokio::spawn(async move {
+                                let output =
+                                    agent::run_agent_task(&cfg, &na, &nt, false, 0)
+                                        .await
+                                        .unwrap_or_else(|e| format!("[{na} error: {e}]"));
+                                let _ = tx.send(agent::task_manager::TaskResult {
+                                    task_id: new_id,
+                                    agent_name: na,
+                                    description: nt,
+                                    output,
+                                }).await;
+                            });
+                        }
+                        // finish() always removes the task from the active list.
+                    }
+
+                    // ── User typed a line ──────────────────────────────────────
+                    Some(maybe_line) = input_rx.recv() => {
+                        let Some(line) = maybe_line else { break; };
                         if line.is_empty() { continue; }
                         if line == "exit" || line == "quit" { break; }
-                        let _ = rl.add_history_entry(&line);
+
+                        // Built-in: list running agents.
+                        if line == "tasks" || line == "status" {
+                            let active = task_manager.active();
+                            if active.is_empty() {
+                                println!("{}", console::style("No agents running.").dim());
+                            } else {
+                                for t in active {
+                                    let queued = if t.queued_count() > 0 {
+                                        format!("  (+{} queued)", t.queued_count())
+                                    } else {
+                                        String::new()
+                                    };
+                                    println!(
+                                        "  {} [{}] {}{}",
+                                        console::style("\u{26a1}").cyan(),
+                                        console::style(&t.agent_name).bold(),
+                                        t.description.chars().take(60).collect::<String>(),
+                                        queued,
+                                    );
+                                }
+                            }
+                            println!();
+                            continue;
+                        }
 
                         let input = if first_turn && !memory_context.is_empty() {
                             first_turn = false;
@@ -430,16 +517,94 @@ async fn cmd_agent(
                             line.clone()
                         };
 
-                        let response = run_with_delegation(&mut agent, &input, &config).await?;
-                        println!("\n{response}\n");
-
-                        if let Some(ref mem) = memory {
-                            let _ = mem.store("conversation", &format!("User: {line}\nAgent: {response}"), None, Some(main_name)).await;
+                        match agent.turn(&input).await? {
+                            TurnResult::Response(text) => {
+                                println!("\n{text}\n");
+                                if let Some(ref mem) = memory {
+                                    let _ = mem.store(
+                                        "conversation",
+                                        &format!("User: {line}\nAgent: {text}"),
+                                        None,
+                                        Some(&main_name_owned),
+                                    ).await;
+                                }
+                            }
+                            TurnResult::Transfer { target_agent, task } => {
+                                let existing = task_manager
+                                    .find_for_agent(&target_agent)
+                                    .map(|id| id.to_string());
+                                if let Some(existing_id) = existing {
+                                    // Same agent already running — queue the follow-up.
+                                    task_manager.enqueue(&existing_id, &task);
+                                    println!(
+                                        "\n{} Follow-up queued for [{}] — runs after current task\n",
+                                        console::style("\u{21a9}").yellow().bold(),
+                                        console::style(&target_agent).bold(),
+                                    );
+                                } else {
+                                    // Spawn a new parallel agent.
+                                    let task_id = task_manager.register(&target_agent, &task);
+                                    let cfg = config.clone();
+                                    let tx  = result_tx.clone();
+                                    let ta  = target_agent.clone();
+                                    let t   = task.clone();
+                                    tokio::spawn(async move {
+                                        let output =
+                                            agent::run_agent_task(&cfg, &ta, &t, false, 0)
+                                                .await
+                                                .unwrap_or_else(|e| format!("[{ta} error: {e}]"));
+                                        let _ = tx.send(agent::task_manager::TaskResult {
+                                            task_id,
+                                            agent_name: ta,
+                                            description: t,
+                                            output,
+                                        }).await;
+                                    });
+                                    println!(
+                                        "\n{} [{}] agent spawned — running in background\n",
+                                        console::style("\u{26a1}").cyan().bold(),
+                                        console::style(&target_agent).bold(),
+                                    );
+                                }
+                            }
                         }
                     }
-                    Err(rustyline::error::ReadlineError::Interrupted) => break,
-                    Err(rustyline::error::ReadlineError::Eof) => break,
-                    Err(e) => { eprintln!("Error: {e}"); break; }
+
+                    // ── Incoming channel message (Telegram / WhatsApp / etc.) ──
+                    Some(chan_msg) = chan_rx.recv() => {
+                        let prefix = format!("[{}] {}", chan_msg.channel, chan_msg.sender);
+                        match agent.turn(&format!("{prefix}: {}", chan_msg.content)).await? {
+                            TurnResult::Response(text) => {
+                                println!("{}: {text}\n", console::style(&prefix).dim());
+                            }
+                            TurnResult::Transfer { target_agent, task } => {
+                                let existing = task_manager
+                                    .find_for_agent(&target_agent)
+                                    .map(|id| id.to_string());
+                                if let Some(existing_id) = existing {
+                                    task_manager.enqueue(&existing_id, &task);
+                                } else {
+                                    let task_id = task_manager.register(&target_agent, &task);
+                                    let cfg = config.clone();
+                                    let tx  = result_tx.clone();
+                                    let ta  = target_agent.clone();
+                                    let t   = task.clone();
+                                    tokio::spawn(async move {
+                                        let output =
+                                            agent::run_agent_task(&cfg, &ta, &t, false, 0)
+                                                .await
+                                                .unwrap_or_else(|e| format!("[{ta} error: {e}]"));
+                                        let _ = tx.send(agent::task_manager::TaskResult {
+                                            task_id,
+                                            agent_name: ta,
+                                            description: t,
+                                            output,
+                                        }).await;
+                                    });
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

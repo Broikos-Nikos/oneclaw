@@ -4,6 +4,7 @@
 
 pub mod dispatcher;
 pub mod prompt;
+pub mod task_manager;
 
 use crate::config::Config;
 use crate::identity;
@@ -197,6 +198,18 @@ impl Agent {
     /// Clear conversation history.
     pub fn clear_history(&mut self) {
         self.history.clear();
+    }
+
+    /// Inject the result of a completed background sub-agent into this agent's
+    /// conversation history. The main agent will be aware of it on the next turn.
+    pub fn inject_result(&mut self, agent_name: &str, result: &str) {
+        self.history.push(ConversationMessage {
+            role: "user".into(),
+            content: format!(
+                "Tool results:\n\n<tool_result name=\"transfer_to_agent\">\nAgent '{agent_name}' completed:\n\n{result}\n</tool_result>"
+            ),
+        });
+        self.trim_history();
     }
 
     /// Run a single turn: send a user message, handle tool calls, return final response.
