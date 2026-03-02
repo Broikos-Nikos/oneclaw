@@ -111,15 +111,12 @@ echo ""
 echo "✅ OneClaw installed to: $CARGO_BIN/oneclaw"
 echo ""
 
-# Verify the binary is reachable
-if ! have_cmd oneclaw; then
-  echo "⚠  'oneclaw' not found in PATH. Run the following, then try again:"
-  echo ""
-  echo "    export PATH=\"\$HOME/.cargo/bin:\$PATH\""
-  echo ""
-  echo "  Or start a new terminal session."
-  echo ""
-  exit 0
+# Use the full path so we don't depend on PATH being updated yet
+ONECLAW_BIN="$CARGO_BIN/oneclaw"
+
+if [ ! -x "$ONECLAW_BIN" ]; then
+  echo "❌ Binary not found at $ONECLAW_BIN — build may have failed."
+  exit 1
 fi
 
 # Run onboard if no config exists
@@ -127,7 +124,9 @@ ONECLAW_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/oneclaw"
 if [ ! -f "$ONECLAW_CONFIG_DIR/config.toml" ]; then
   echo "🔧 Running initial setup..."
   echo ""
-  oneclaw onboard
+  # When piped via curl|bash, stdin is the script itself (not the terminal).
+  # Redirect from /dev/tty so dialoguer interactive prompts work.
+  "$ONECLAW_BIN" onboard </dev/tty
 else
   echo "Existing config found. Skipping setup."
   echo ""
@@ -139,5 +138,9 @@ else
 fi
 
 echo ""
-echo "🦀 Done! Run 'oneclaw agent' to start."
+echo "🦀 Done!"
+echo ""
+echo "If 'oneclaw' is not found, run:"
+echo "  source ~/.bashrc    # or: source ~/.zshrc"
+echo "  oneclaw agent       # start chatting"
 echo ""

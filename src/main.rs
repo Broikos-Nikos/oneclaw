@@ -689,10 +689,7 @@ async fn cmd_onboard(use_defaults: bool) -> Result<()> {
                 .interact()?;
 
             if wa_mode == 0 {
-                // QR / Web mode
-                println!("  → Build oneclaw with --features whatsapp-web to enable QR mode.");
-                println!("  → Start the daemon and scan the QR in WhatsApp > Linked Devices.");
-                println!();
+                // QR / Web mode — QR pairing happens automatically after config is saved.
                 let session_path: String = dialoguer::Input::new()
                     .with_prompt("  Session database path")
                     .default("~/.oneclaw/state/whatsapp-web/session.db".into())

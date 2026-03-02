@@ -31,6 +31,7 @@ pub fn manage(action: ServiceAction, bin_path: &Path) -> Result<()> {
 fn manage_systemd(action: ServiceAction, bin_path: &Path) -> Result<()> {
     use std::process::Command;
 
+    let home = std::env::var("HOME").context("$HOME not set")?;
     let unit = format!(
         r#"[Unit]
 Description=OneClaw AI Assistant Daemon
@@ -41,14 +42,16 @@ Type=simple
 ExecStart={bin} daemon
 Restart=on-failure
 RestartSec=5
+Environment=HOME={home}
+Environment=PATH={home}/.cargo/bin:/usr/local/bin:/usr/bin:/bin
 
 [Install]
 WantedBy=default.target
 "#,
-        bin = bin_path.display()
+        bin = bin_path.display(),
+        home = home,
     );
 
-    let home = std::env::var("HOME").context("$HOME not set")?;
     let service_dir = Path::new(&home).join(".config/systemd/user");
     std::fs::create_dir_all(&service_dir)?;
     let service_path = service_dir.join("oneclaw.service");
@@ -58,7 +61,10 @@ WantedBy=default.target
             std::fs::write(&service_path, unit)?;
             Command::new("systemctl").args(["--user", "daemon-reload"]).status().ok();
             Command::new("systemctl").args(["--user", "enable", "--now", "oneclaw"]).status().ok();
+            // Enable lingering so the user service starts on boot even without a login session.
+            Command::new("loginctl").args(["enable-linger"]).status().ok();
             println!("✅ OneClaw service installed and started (systemd user service)");
+            println!("   Auto-starts on reboot (linger enabled)");
             println!("   Logs: journalctl --user -u oneclaw -f");
         }
         ServiceAction::Uninstall => {
