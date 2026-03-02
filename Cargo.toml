@@ -20,7 +20,7 @@ tokio = { version = "1.42", default-features = false, features = [
 ] }
 
 # HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream", "multipart"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -77,6 +77,34 @@ base64 = "0.22"
 
 # Cron expression parsing
 cron = "0.12"
+
+# Concurrency
+parking_lot = "0.12"
+
+# Terminal QR rendering for WhatsApp Web pairing flow
+qrcode = { version = "0.14", optional = true }
+
+# Protobuf (WhatsApp Web protocol) — enabled by whatsapp-web feature
+prost = { version = "0.14", default-features = false, features = ["derive"], optional = true }
+
+# Large-array serde (wa-rs storage) — enabled by whatsapp-web feature
+serde-big-array = { version = "0.5", optional = true }
+
+# WhatsApp Web client (wa-rs) — optional, enable with --features whatsapp-web
+wa-rs = { version = "0.2", optional = true, default-features = false }
+wa-rs-core = { version = "0.2", optional = true, default-features = false }
+wa-rs-binary = { version = "0.2", optional = true, default-features = false }
+wa-rs-proto = { version = "0.2", optional = true, default-features = false }
+wa-rs-ureq-http = { version = "0.2", optional = true }
+wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = false }
+
+[features]
+# whatsapp-web = Native WhatsApp Web client (QR / pair-code, no Meta API required)
+whatsapp-web = [
+    "dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-proto",
+    "dep:wa-rs-ureq-http", "dep:wa-rs-tokio-transport",
+    "dep:serde-big-array", "dep:prost", "dep:qrcode",
+]
 
 [profile.release]
 opt-level = "z"

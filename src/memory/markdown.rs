@@ -1,88 +1,25 @@
-// Markdown memory backend — stores entries as .md files in a directory.
+// Markdown memory backend — single MEMORY.md file in the workspace.
+//
+// All agent memory is stored as plain markdown in one file.
+// The full file content is injected into the first prompt turn each session.
 
 use super::{Memory, MemoryEntry};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
 pub struct MarkdownMemory {
-    dir: PathBuf,
+    path: PathBuf,
 }
 
 impl MarkdownMemory {
-    pub async fn new(dir: &Path) -> Result<Self> {
-        fs::create_dir_all(dir)
-            .await
-            .with_context(|| format!("Failed to create markdown memory dir: {}", dir.display()))?;
-        Ok(Self { dir: dir.to_path_buf() })
-    }
-
-    fn entry_path(&self, id: &str) -> PathBuf {
-        self.dir.join(format!("{id}.md"))
-    }
-
-    fn parse_entry(content: &str, id: &str) -> Option<MemoryEntry> {
-        // Format:
-        // ---
-        // id: <uuid>
-        // category: <cat>
-        // created_at: <rfc3339>
-        // session_id: <optional>
-        // agent_type: <optional>
-        // ---
-        // <content>
-        let content = content.trim();
-        if !content.starts_with("---") {
-            return None;
+    pub async fn new(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).await?;
         }
-        let rest = content.strip_prefix("---")?;
-        let (frontmatter, body) = rest.split_once("\n---")?;
-
-        let mut category = String::new();
-        let mut created_at = Utc::now();
-        let mut session_id: Option<String> = None;
-        let mut agent_type: Option<String> = None;
-
-        for line in frontmatter.trim().lines() {
-            if let Some(val) = line.strip_prefix("category: ") {
-                category = val.trim().to_string();
-            } else if let Some(val) = line.strip_prefix("created_at: ") {
-                created_at = val.trim().parse().unwrap_or(Utc::now());
-            } else if let Some(val) = line.strip_prefix("session_id: ") {
-                let v = val.trim();
-                if v != "null" && !v.is_empty() {
-                    session_id = Some(v.to_string());
-                }
-            } else if let Some(val) = line.strip_prefix("agent_type: ") {
-                let v = val.trim();
-                if v != "null" && !v.is_empty() {
-                    agent_type = Some(v.to_string());
-                }
-            }
-        }
-
-        Some(MemoryEntry {
-            id: id.to_string(),
-            category,
-            content: body.trim().to_string(),
-            created_at,
-            session_id,
-            agent_type,
-        })
-    }
-
-    fn entry_to_md(entry: &MemoryEntry) -> String {
-        format!(
-            "---\nid: {}\ncategory: {}\ncreated_at: {}\nsession_id: {}\nagent_type: {}\n---\n{}\n",
-            entry.id,
-            entry.category,
-            entry.created_at.to_rfc3339(),
-            entry.session_id.as_deref().unwrap_or("null"),
-            entry.agent_type.as_deref().unwrap_or("null"),
-            entry.content,
-        )
+        Ok(Self { path: path.to_path_buf() })
     }
 }
 
@@ -90,84 +27,58 @@ impl MarkdownMemory {
 impl Memory for MarkdownMemory {
     async fn store(
         &self,
-        category: &str,
+        _category: &str,
         content: &str,
-        session_id: Option<&str>,
-        agent_type: Option<&str>,
+        _session_id: Option<&str>,
+        _agent_type: Option<&str>,
     ) -> Result<String> {
         let id = uuid::Uuid::new_v4().to_string();
-        let entry = MemoryEntry {
-            id: id.clone(),
-            category: category.to_string(),
-            content: content.to_string(),
-            created_at: Utc::now(),
-            session_id: session_id.map(String::from),
-            agent_type: agent_type.map(String::from),
-        };
-        let md = Self::entry_to_md(&entry);
-        fs::write(self.entry_path(&id), md).await?;
+        let now = Utc::now().format("%Y-%m-%d %H:%M").to_string();
+        let line = format!("\n- [{}] {}\n", now, content);
+        let mut current = fs::read_to_string(&self.path).await.unwrap_or_default();
+        current.push_str(&line);
+        fs::write(&self.path, &current).await?;
         Ok(id)
     }
 
-    async fn recall(&self, category: Option<&str>, limit: usize) -> Result<Vec<MemoryEntry>> {
-        let mut entries = self.all_entries().await?;
-        if let Some(cat) = category {
-            entries.retain(|e| e.category == cat);
-        }
-        entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        entries.truncate(limit);
-        Ok(entries)
+    async fn recall(&self, _category: Option<&str>, _limit: usize) -> Result<Vec<MemoryEntry>> {
+        let content = match fs::read_to_string(&self.path).await {
+            Ok(c) if !c.trim().is_empty() => c,
+            _ => return Ok(vec![]),
+        };
+        Ok(vec![MemoryEntry {
+            id: "memory.md".to_string(),
+            category: "memory".to_string(),
+            content,
+            created_at: Utc::now(),
+            session_id: None,
+            agent_type: None,
+        }])
     }
 
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>> {
-        let query_lower = query.to_lowercase();
-        let mut entries = self.all_entries().await?;
-        entries.retain(|e| e.content.to_lowercase().contains(&query_lower));
-        entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        entries.truncate(limit);
-        Ok(entries)
+        let entries = self.recall(None, limit).await?;
+        let q = query.to_lowercase();
+        Ok(entries.into_iter().filter(|e| e.content.to_lowercase().contains(&q)).collect())
     }
 
-    async fn forget(&self, id: &str) -> Result<bool> {
-        let path = self.entry_path(id);
-        if path.exists() {
-            fs::remove_file(path).await?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
+    async fn forget(&self, _id: &str) -> Result<bool> {
+        fs::write(&self.path, "").await?;
+        Ok(true)
     }
 
-    async fn clear(&self, category: Option<&str>) -> Result<u64> {
-        let entries = self.all_entries().await?;
-        let mut count = 0u64;
-        for entry in entries {
-            if category.map_or(true, |c| c == entry.category) {
-                if fs::remove_file(self.entry_path(&entry.id)).await.is_ok() {
-                    count += 1;
-                }
-            }
-        }
-        Ok(count)
+    async fn clear(&self, _category: Option<&str>) -> Result<u64> {
+        fs::write(&self.path, "").await?;
+        Ok(1)
     }
 }
 
+// NOTE: The old per-entry-file parse/write helpers are removed.
+// The following dead code was previously impl blocks that stored entries —
+// replaced by the single-file approach above.
+
 impl MarkdownMemory {
-    async fn all_entries(&self) -> Result<Vec<MemoryEntry>> {
-        let mut entries = Vec::new();
-        let mut dir = fs::read_dir(&self.dir).await?;
-        while let Some(entry) = dir.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if let Ok(content) = fs::read_to_string(&path).await {
-                        if let Some(mem) = Self::parse_entry(&content, stem) {
-                            entries.push(mem);
-                        }
-                    }
-                }
-            }
-        }
-        Ok(entries)
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 }

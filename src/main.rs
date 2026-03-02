@@ -60,14 +60,13 @@ Examples:
   oneclaw agent                           # interactive session
   oneclaw agent -m \"Build a REST API\"     # single-shot
   oneclaw agent --agent developer -m \"Fix the bug\"
-  oneclaw agent --memory sqlite           # explicit memory backend
-  oneclaw agent --memory none             # disable memory injection")]
+  oneclaw agent --memory none             # disable MEMORY.md injection")]
     Agent {
         #[arg(short, long)]
         message: Option<String>,
         #[arg(short = 'a', long)]
         agent: Option<String>,
-        /// Memory backend override (sqlite, markdown, vector, none)
+        /// Memory: pass "none" to disable MEMORY.md injection
         #[arg(long)]
         memory: Option<String>,
     },
@@ -358,17 +357,11 @@ async fn cmd_agent(
         .as_deref()
         .unwrap_or(&config.memory.backend);
     let memory_backend = MemoryBackend::from_str(memory_backend_str).unwrap_or_default();
-    let data_dir = Config::data_dir();
-    let memory = memory::build_memory(
-        &memory_backend,
-        &data_dir,
-        &config.memory.embed_url,
-        &config.memory.embed_model,
-    ).await.unwrap_or(None);
+    let memory = memory::build_memory(&memory_backend, &workspace_dir).await.unwrap_or(None);
 
     // Inject recent memories into first turn if any
     let memory_context = if let Some(ref mem) = memory {
-        let entries = mem.recall(None, config.memory.recall_limit).await.unwrap_or_default();
+        let entries = mem.recall(None, 100).await.unwrap_or_default();
         memory::entries_to_prompt(&entries)
     } else {
         String::new()
@@ -575,60 +568,144 @@ fn cmd_onboard(use_defaults: bool) -> Result<()> {
             (m, base_url_override)
         };
 
-        // Memory backend
-        let mem_backends = &["sqlite (default)", "markdown (file-per-entry)", "vector (semantic search)", "none (disabled)"];
-        let mem_idx = dialoguer::Select::new()
-            .with_prompt("Memory backend")
-            .items(mem_backends)
-            .default(0)
+        // ── Channels ─────────────────────────────────────────────────────────
+        let channel_items = &["Telegram", "WhatsApp"];
+        let channel_selections = dialoguer::MultiSelect::new()
+            .with_prompt("Which channels to configure? (space to toggle, enter to confirm)")
+            .items(channel_items)
             .interact()?;
-        let mem_backend = match mem_idx {
-            1 => "markdown",
-            2 => "vector",
-            3 => "none",
-            _ => "sqlite",
-        }.to_string();
 
         // Telegram
-        let use_telegram = dialoguer::Confirm::new()
-            .with_prompt("Configure Telegram channel? (requires a Telegram bot token)")
-            .default(false)
-            .interact()?;
-        let telegram = if use_telegram {
-            println!("  → Create a bot: open Telegram, message @BotFather, run /newbot");
-            let token: String = dialoguer::Password::new().with_prompt("Bot token (from @BotFather)").interact()?;
-            Some(config::TelegramConfig {
-                bot_token: token,
-                allowed_users: vec!["*".to_string()],
-            })
-        } else { None };
+        let telegram = if channel_selections.contains(&0) {
+            println!();
+            println!("  Telegram Setup");
+            println!("  1. Open Telegram and message @BotFather, run /newbot");
+            println!("  2. Copy the token and paste it below.");
+            println!();
+            let token: String = dialoguer::Password::new()
+                .with_prompt("  Bot token (from @BotFather)")
+                .interact()?;
+            if token.trim().is_empty() {
+                println!("  → Skipped");
+                None
+            } else {
+                let users_str: String = dialoguer::Input::new()
+                    .with_prompt("  Allowed usernames (comma-separated, or * for all)")
+                    .default("*".into())
+                    .interact_text()?;
+                let allowed_users = if users_str.trim() == "*" {
+                    vec!["*".to_string()]
+                } else {
+                    users_str.split(',').map(|s| s.trim().to_string()).collect()
+                };
+                Some(config::TelegramConfig { bot_token: token.trim().to_string(), allowed_users })
+            }
+        } else {
+            None
+        };
 
         // WhatsApp
-        let use_wa = dialoguer::Confirm::new()
-            .with_prompt("Configure WhatsApp channel? (requires Meta app + public webhook URL)")
-            .default(false)
-            .interact()?;
-        let whatsapp = if use_wa {
-            println!("  → Get your credentials at: https://developers.facebook.com/apps/");
-            let token: String = dialoguer::Password::new().with_prompt("Meta access token").interact()?;
-            let phone_id: String = dialoguer::Input::new().with_prompt("Phone number ID").interact_text()?;
-            let verify: String = dialoguer::Input::new()
-                .with_prompt("Webhook verify token (you choose a secret string)")
-                .default("oneclaw-verify".into())
-                .interact_text()?;
-            let port_str: String = dialoguer::Input::new()
-                .with_prompt("Webhook listener port")
-                .default("8443".into())
-                .interact_text()?;
-            let webhook_port: u16 = port_str.parse().unwrap_or(8443);
-            Some(config::WhatsAppConfig {
-                access_token: token,
-                phone_number_id: phone_id,
-                verify_token: verify,
-                allowed_numbers: vec!["*".to_string()],
-                webhook_port,
-            })
-        } else { None };
+        let whatsapp = if channel_selections.contains(&1) {
+            println!();
+            println!("  WhatsApp Setup");
+            println!();
+            let wa_mode_options = &[
+                "QR / Web  — scan QR in WhatsApp > Linked Devices (no Meta account needed)",
+                "Cloud API — Meta Business webhook (requires Meta app + public URL)",
+            ];
+            let wa_mode = dialoguer::Select::new()
+                .with_prompt("  WhatsApp mode")
+                .items(wa_mode_options)
+                .default(0)
+                .interact()?;
+
+            if wa_mode == 0 {
+                // QR / Web mode
+                println!("  → Build oneclaw with --features whatsapp-web to enable QR mode.");
+                println!("  → Start the daemon and scan the QR in WhatsApp > Linked Devices.");
+                println!();
+                let session_path: String = dialoguer::Input::new()
+                    .with_prompt("  Session database path")
+                    .default("~/.oneclaw/state/whatsapp-web/session.db".into())
+                    .interact_text()?;
+                if session_path.trim().is_empty() {
+                    println!("  → Skipped — session path required");
+                    None
+                } else {
+                    let pair_phone: String = dialoguer::Input::new()
+                        .with_prompt("  Pair phone (optional, digits only; leave empty to use QR flow)")
+                        .allow_empty(true)
+                        .interact_text()?;
+                    let users_str: String = dialoguer::Input::new()
+                        .with_prompt("  Allowed phone numbers (comma-separated +E.164, or * for all)")
+                        .default("*".into())
+                        .interact_text()?;
+                    let allowed_numbers = if users_str.trim() == "*" {
+                        vec!["*".to_string()]
+                    } else {
+                        users_str.split(',').map(|s| s.trim().to_string()).collect()
+                    };
+                    Some(config::WhatsAppConfig {
+                        session_path: Some(session_path.trim().to_string()),
+                        pair_phone: (!pair_phone.trim().is_empty()).then(|| pair_phone.trim().to_string()),
+                        pair_code: None,
+                        access_token: None,
+                        phone_number_id: None,
+                        verify_token: None,
+                        webhook_port: 8443,
+                        allowed_numbers,
+                    })
+                }
+            } else {
+                // Cloud API mode
+                println!("  1. Go to developers.facebook.com and create a WhatsApp app");
+                println!("  2. Add the WhatsApp product and get your phone number ID");
+                println!("  3. Generate an access token (System User)");
+                println!("  4. Configure webhook URL to: https://your-domain/webhook");
+                println!();
+                let token: String = dialoguer::Input::new()
+                    .with_prompt("  Access token (from Meta Developers)")
+                    .interact_text()?;
+                if token.trim().is_empty() {
+                    println!("  → Skipped");
+                    None
+                } else {
+                    let phone_id: String = dialoguer::Input::new()
+                        .with_prompt("  Phone number ID (from WhatsApp app settings)")
+                        .interact_text()?;
+                    if phone_id.trim().is_empty() {
+                        println!("  → Skipped — phone number ID required");
+                        None
+                    } else {
+                        let verify: String = dialoguer::Input::new()
+                            .with_prompt("  Webhook verify token")
+                            .default("oneclaw-verify".into())
+                            .interact_text()?;
+                        let users_str: String = dialoguer::Input::new()
+                            .with_prompt("  Allowed numbers (comma-separated +E.164, or * for all)")
+                            .default("*".into())
+                            .interact_text()?;
+                        let allowed_numbers = if users_str.trim() == "*" {
+                            vec!["*".to_string()]
+                        } else {
+                            users_str.split(',').map(|s| s.trim().to_string()).collect()
+                        };
+                        Some(config::WhatsAppConfig {
+                            session_path: None,
+                            pair_phone: None,
+                            pair_code: None,
+                            access_token: Some(token.trim().to_string()),
+                            phone_number_id: Some(phone_id.trim().to_string()),
+                            verify_token: Some(verify.trim().to_string()),
+                            webhook_port: 8443,
+                            allowed_numbers,
+                        })
+                    }
+                }
+            }
+        } else {
+            None
+        };
 
         let mut c = Config::default();
         c.providers.insert("main".to_string(), config::ProviderConfig {
@@ -638,7 +715,6 @@ fn cmd_onboard(use_defaults: bool) -> Result<()> {
             base_url,
             temperature: 0.7,
         });
-        c.memory.backend = mem_backend;
         c.channels.telegram = telegram;
         c.channels.whatsapp = whatsapp;
         c
@@ -675,9 +751,15 @@ fn cmd_onboard(use_defaults: bool) -> Result<()> {
         println!("    Run 'oneclaw daemon' to receive messages.");
     }
     if config.channels.whatsapp.is_some() {
-        println!("  → WhatsApp: point your Meta webhook to http://<your-ip>:<port>/webhook");
-        println!("    Use ngrok or Cloudflare Tunnel to expose the port publicly.");
-        println!("    Run 'oneclaw daemon' to start the webhook listener.");
+        let wa = config.channels.whatsapp.as_ref().unwrap();
+        if wa.session_path.is_some() {
+            println!("  → WhatsApp Web: run 'oneclaw daemon' and scan the QR code shown in the terminal.");
+            println!("    Open WhatsApp > Linked Devices > Link a Device.");
+        } else {
+            println!("  → WhatsApp Cloud API: point your Meta webhook to http://<your-ip>:8443/webhook");
+            println!("    Use ngrok or Cloudflare Tunnel to expose the port publicly.");
+            println!("    Run 'oneclaw daemon' to start the webhook listener.");
+        }
     }
     println!();
     println!("Tip: edit {}  to customize the main agent's personality.", souls_dir.join("main").join("SOUL.md").display());
@@ -789,11 +871,11 @@ fn cmd_goal(sc: GoalCommands) -> Result<()> {
 async fn cmd_memory(sc: MemoryCommands) -> Result<()> {
     let config = Config::load()?;
     let backend = MemoryBackend::from_str(&config.memory.backend).unwrap_or_default();
-    let data_dir = Config::data_dir();
-    let mem = memory::build_memory(&backend, &data_dir, &config.memory.embed_url, &config.memory.embed_model).await?;
+    let workspace_dir = config.workspace_dir();
+    let mem = memory::build_memory(&backend, &workspace_dir).await?;
 
     let Some(mem) = mem else {
-        println!("Memory backend is 'none'. Enable it in config.toml [memory] backend = \"sqlite\".");
+        println!("Memory is disabled. Enable it in config.toml: [memory] backend = \"markdown\".");
         return Ok(());
     };
 
@@ -834,13 +916,7 @@ async fn cmd_memory(sc: MemoryCommands) -> Result<()> {
         }
         MemoryCommands::Stats => {
             let stats = mem.stats().await?;
-            println!("Total entries: {}", stats.total);
-            println!("By category:");
-            let mut cats: Vec<_> = stats.by_category.iter().collect();
-            cats.sort_by_key(|(k, _)| k.as_str());
-            for (cat, count) in cats {
-                println!("  {cat}: {count}");
-            }
+            println!("MEMORY.md lines: {}", stats.total);
         }
     }
     Ok(())
@@ -925,7 +1001,7 @@ fn cmd_status() -> Result<()> {
     println!("Config    : {}", config_path.display());
     println!("Workspace : {}", config.workspace_dir().display());
     println!("Agents    : {}", config.souls_dir().display());
-    println!("Memory    : {} (recall={})", config.memory.backend, config.memory.recall_limit);
+    println!("Memory    : {}", config.memory.backend);
     println!("Heartbeat : {}s", config.daemon.heartbeat_interval_secs);
     println!();
 

@@ -71,32 +71,19 @@ fn default_souls_dir() -> String { "~/.oneclaw/agents".to_string() }
 /// Memory configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MemoryConfig {
-    /// Backend: sqlite (default), markdown, vector, none
+    /// Backend: markdown (default) | none
+    /// markdown — single MEMORY.md file in the workspace, injected at session start
+    /// none     — memory disabled
     #[serde(default = "default_memory_backend")]
     pub backend: String,
-    /// Embedding URL for vector backend (default: Ollama localhost)
-    #[serde(default = "default_embed_url")]
-    pub embed_url: String,
-    /// Embedding model (default: nomic-embed-text)
-    #[serde(default = "default_embed_model")]
-    pub embed_model: String,
-    /// How many recent memories to inject into each prompt
-    #[serde(default = "default_recall_limit")]
-    pub recall_limit: usize,
 }
 
-fn default_memory_backend() -> String { "sqlite".to_string() }
-fn default_embed_url() -> String { "http://localhost:11434".to_string() }
-fn default_embed_model() -> String { "nomic-embed-text".to_string() }
-fn default_recall_limit() -> usize { 10 }
+fn default_memory_backend() -> String { "markdown".to_string() }
 
 impl Default for MemoryConfig {
     fn default() -> Self {
         Self {
             backend: default_memory_backend(),
-            embed_url: default_embed_url(),
-            embed_model: default_embed_model(),
-            recall_limit: default_recall_limit(),
         }
     }
 }
@@ -146,22 +133,92 @@ pub struct TelegramConfig {
 
 fn default_allowed_users() -> Vec<String> { vec!["*".to_string()] }
 
-/// WhatsApp Business Cloud API channel configuration.
+/// WhatsApp channel configuration.
+///
+/// Supports two modes:
+/// - **Web mode** (QR / pair-code): set `session_path`. Requires the `whatsapp-web` feature.
+/// - **Cloud API mode**: set `access_token` + `phone_number_id`. Requires a Meta Business account.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhatsAppConfig {
-    pub access_token: String,
-    pub phone_number_id: String,
-    #[serde(default = "default_verify_token")]
-    pub verify_token: String,
-    #[serde(default = "default_allowed_numbers")]
-    pub allowed_numbers: Vec<String>,
+    // ── Cloud API fields ──────────────────────────────────────────────────
+    #[serde(default)]
+    pub access_token: Option<String>,
+    #[serde(default)]
+    pub phone_number_id: Option<String>,
+    #[serde(default)]
+    pub verify_token: Option<String>,
     #[serde(default = "default_webhook_port")]
     pub webhook_port: u16,
+
+    // ── Web / QR mode fields ──────────────────────────────────────────────
+    /// Path to the WhatsApp Web session database (enables QR/web mode).
+    #[serde(default)]
+    pub session_path: Option<String>,
+    /// Phone number for pair-code linking (optional; leave unset to use QR).
+    #[serde(default)]
+    pub pair_phone: Option<String>,
+    /// Custom pair code (optional; auto-generated when `pair_phone` is set).
+    #[serde(default)]
+    pub pair_code: Option<String>,
+
+    // ── Shared fields ──────────────────────────────────────────────────────
+    #[serde(default = "default_allowed_numbers")]
+    pub allowed_numbers: Vec<String>,
 }
 
-fn default_verify_token() -> String { "oneclaw-verify".to_string() }
-fn default_allowed_numbers() -> Vec<String> { vec!["*".to_string()] }
 fn default_webhook_port() -> u16 { 8443 }
+fn default_allowed_numbers() -> Vec<String> { vec!["*".to_string()] }
+
+// ─── Voice transcription ─────────────────────────────────────────────────────
+
+/// Voice transcription configuration (Whisper API via Groq).
+/// Used by WhatsApp Web channel to transcribe voice messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TranscriptionConfig {
+    /// Enable voice transcription for channels that support it.
+    #[serde(default)]
+    pub enabled: bool,
+    /// API key for the transcription endpoint (falls back to GROQ_API_KEY env var).
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Whisper API endpoint URL.
+    #[serde(default = "default_transcription_api_url")]
+    pub api_url: String,
+    /// Whisper model name.
+    #[serde(default = "default_transcription_model")]
+    pub model: String,
+    /// Language hint (ISO-639-1, e.g. "en").
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Maximum voice duration in seconds (longer messages are skipped).
+    #[serde(default = "default_transcription_max_duration")]
+    pub max_duration_secs: u64,
+}
+
+fn default_transcription_api_url() -> String {
+    "https://api.groq.com/openai/v1/audio/transcriptions".to_string()
+}
+fn default_transcription_model() -> String { "whisper-large-v3-turbo".to_string() }
+fn default_transcription_max_duration() -> u64 { 120 }
+
+impl Default for TranscriptionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_key: None,
+            api_url: default_transcription_api_url(),
+            model: default_transcription_model(),
+            language: None,
+            max_duration_secs: default_transcription_max_duration(),
+        }
+    }
+}
+
+/// Build a reqwest HTTP client for a named service.
+/// Oneclaw does not configure per-service proxies, so this returns a plain client.
+pub fn build_runtime_proxy_client(_service_key: &str) -> reqwest::Client {
+    reqwest::Client::new()
+}
 
 impl Config {
     pub fn load() -> Result<Self> {
@@ -269,17 +326,11 @@ path = "~/.oneclaw/workspace"
 souls_dir = "~/.oneclaw/agents"
 
 # ── Memory ─────────────────────────────────────────────────────
-# backend: sqlite (default) | markdown | vector | none
-#   sqlite   -- SQLite, fast keyword search
-#   markdown -- one .md file per entry, human-readable
-#   vector   -- SQLite + Ollama embeddings, semantic similarity search
+# backend: markdown (default) | none
+#   markdown -- single MEMORY.md file in workspace, injected at session start
 #   none     -- memory disabled
 [memory]
-backend = "sqlite"
-recall_limit = 10
-# For vector backend (semantic search via local Ollama):
-# embed_url   = "http://localhost:11434"
-# embed_model = "nomic-embed-text"
+backend = "markdown"
 
 # ── Daemon ─────────────────────────────────────────────────────
 [daemon]
@@ -293,8 +344,15 @@ heartbeat_interval_secs = 60
 # bot_token     = "123456:ABCdef-YOUR_TOKEN"
 # allowed_users = ["*"]  # or ["your_username", "numeric_id"]
 
-# WhatsApp — requires Meta Business account + WhatsApp Cloud API credentials.
-# A public HTTPS URL is needed for the webhook (use ngrok during dev).
+# WhatsApp — two modes:
+#
+# Mode A: Web / QR scan (no Meta account needed, requires --features whatsapp-web)
+# [channels.whatsapp]
+# session_path    = "~/.oneclaw/state/whatsapp-web/session.db"
+# pair_phone      = ""            # optional: digits-only phone for pair-code flow
+# allowed_numbers = ["*"]
+#
+# Mode B: Business Cloud API (requires Meta Business account + public webhook URL)
 # [channels.whatsapp]
 # access_token    = "YOUR_META_ACCESS_TOKEN"
 # phone_number_id = "YOUR_PHONE_NUMBER_ID"

@@ -3,7 +3,6 @@
 use super::{Memory, MemoryEntry, MemoryStats};
 use anyhow::Result;
 use async_trait::async_trait;
-use std::collections::HashMap;
 
 /// Memory backend that stores nothing and recalls nothing.
 /// Used when `memory.backend = "none"` in config.
@@ -50,9 +49,6 @@ impl Memory for NoneMemory {
     }
 
     async fn stats(&self) -> Result<MemoryStats> {
-        Ok(MemoryStats {
-            total: 0,
-            by_category: HashMap::new(),
-        })
+        Ok(MemoryStats { total: 0 })
     }
 }

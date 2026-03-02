@@ -1,15 +1,16 @@
-// Memory trait and all backends.
+// Memory system.
+//
+// Agents have two forms of memory:
+//   1. Session memory  — the live conversation history held in Agent::history.
+//   2. MEMORY.md       — a persistent markdown file in the workspace directory.
+//                        Injected into the first prompt turn each session.
 //
 // Backends:
-//   sqlite   (default) — SQLite, keyword search
-//   markdown           — one Markdown file per entry
-//   vector             — SQLite + Ollama embeddings for semantic search
-//   none               — disabled, stores nothing
+//   markdown (default) — single MEMORY.md file in the workspace
+//   none               — disabled, injects nothing
 
 pub mod markdown;
 pub mod none;
-pub mod sqlite;
-pub mod vector;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -28,39 +29,35 @@ pub struct MemoryEntry {
     pub agent_type: Option<String>,
 }
 
-/// Memory trait — persistent storage for agent context.
+/// Memory trait — persistent storage backed by MEMORY.md.
 #[async_trait]
 pub trait Memory: Send + Sync {
-    /// Store a new memory entry.
+    /// Append content to MEMORY.md.
     async fn store(&self, category: &str, content: &str, session_id: Option<&str>, agent_type: Option<&str>) -> Result<String>;
 
-    /// Recall memory entries, optionally filtered by category.
+    /// Return the full contents of MEMORY.md as a single entry (or empty vec).
     async fn recall(&self, category: Option<&str>, limit: usize) -> Result<Vec<MemoryEntry>>;
 
-    /// Search memory entries by content (keyword or vector similarity).
+    /// Search MEMORY.md for a keyword.
     async fn search(&self, query: &str, limit: usize) -> Result<Vec<MemoryEntry>>;
 
-    /// Delete a memory entry by ID.
+    /// Truncate MEMORY.md.
     async fn forget(&self, id: &str) -> Result<bool>;
 
-    /// Clear all entries in a category (or all if None).
+    /// Truncate MEMORY.md (category arg ignored).
     async fn clear(&self, category: Option<&str>) -> Result<u64>;
 
-    /// Statistics summary.
+    /// Basic stats.
     async fn stats(&self) -> Result<MemoryStats> {
-        let all = self.recall(None, 10_000).await?;
-        let mut categories = std::collections::HashMap::new();
-        for e in &all {
-            *categories.entry(e.category.clone()).or_insert(0u64) += 1;
-        }
-        Ok(MemoryStats { total: all.len() as u64, by_category: categories })
+        let all = self.recall(None, 1).await?;
+        let lines = all.first().map(|e| e.content.lines().count()).unwrap_or(0);
+        Ok(MemoryStats { total: lines as u64 })
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct MemoryStats {
     pub total: u64,
-    pub by_category: std::collections::HashMap<String, u64>,
 }
 
 /// Which memory backend to use.
@@ -68,9 +65,7 @@ pub struct MemoryStats {
 #[serde(rename_all = "lowercase")]
 pub enum MemoryBackend {
     #[default]
-    Sqlite,
     Markdown,
-    Vector,
     None,
 }
 
@@ -78,11 +73,9 @@ impl std::str::FromStr for MemoryBackend {
     type Err = anyhow::Error;
     fn from_str(s: &str) -> Result<Self> {
         match s.to_lowercase().as_str() {
-            "sqlite" | "sql" => Ok(MemoryBackend::Sqlite),
-            "markdown" | "md" => Ok(MemoryBackend::Markdown),
-            "vector" | "vec" => Ok(MemoryBackend::Vector),
+            "markdown" | "md" | "file" => Ok(MemoryBackend::Markdown),
             "none" | "off" => Ok(MemoryBackend::None),
-            other => anyhow::bail!("Unknown memory backend: {other}. Options: sqlite, markdown, vector, none"),
+            other => anyhow::bail!("Unknown memory backend: {other}. Options: markdown, none"),
         }
     }
 }
@@ -90,54 +83,35 @@ impl std::str::FromStr for MemoryBackend {
 impl std::fmt::Display for MemoryBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            MemoryBackend::Sqlite => write!(f, "sqlite"),
             MemoryBackend::Markdown => write!(f, "markdown"),
-            MemoryBackend::Vector => write!(f, "vector"),
             MemoryBackend::None => write!(f, "none"),
         }
     }
 }
 
-/// Build the appropriate memory backend from config.
+/// Build the memory backend.
 ///
+/// `workspace_dir` is the agent workspace; MEMORY.md lives there.
 /// Returns `None` when backend is `None` (disabled).
 pub async fn build_memory(
     backend: &MemoryBackend,
-    data_dir: &Path,
-    embed_url: &str,
-    embed_model: &str,
+    workspace_dir: &Path,
 ) -> Result<Option<Box<dyn Memory>>> {
     match backend {
         MemoryBackend::None => Ok(None),
-        MemoryBackend::Sqlite => {
-            let db = data_dir.join("memory.db");
-            Ok(Some(Box::new(sqlite::SqliteMemory::new(&db)?)))
-        }
         MemoryBackend::Markdown => {
-            let dir = data_dir.join("memory");
-            Ok(Some(Box::new(markdown::MarkdownMemory::new(&dir).await?)))
-        }
-        MemoryBackend::Vector => {
-            let db = data_dir.join("vector_memory.db");
-            Ok(Some(Box::new(vector::VectorMemory::new(&db, embed_url, embed_model)?)))
+            let path = workspace_dir.join("MEMORY.md");
+            Ok(Some(Box::new(markdown::MarkdownMemory::new(&path).await?)))
         }
     }
 }
 
-/// Format a memory entry for display in the system prompt.
+/// Inject the MEMORY.md content into the system prompt.
 pub fn entries_to_prompt(entries: &[MemoryEntry]) -> String {
-    if entries.is_empty() {
-        return String::new();
+    match entries.first() {
+        Some(e) if !e.content.trim().is_empty() => {
+            format!("## MEMORY.md\n\n{}\n\n", e.content.trim())
+        }
+        _ => String::new(),
     }
-    let mut s = "## Recalled Memories\n\n".to_string();
-    for e in entries {
-        s.push_str(&format!(
-            "- [{}] {}: {}\n",
-            e.category,
-            e.created_at.format("%Y-%m-%d"),
-            e.content
-        ));
-    }
-    s.push('\n');
-    s
 }
